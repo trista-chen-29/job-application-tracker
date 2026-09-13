@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Profile{% endblock %}
+{% block content %}
+<h1>Profile and tracks</h1>
+<p class="lede">Keep this major-agnostic: skills, tracks, and materials rather than a single major template.</p>
+<form method="post" class="card">
+  {% csrf_token %}
+  <div class="form-grid">{{ form.as_p }}</div>
+  <button class="btn" type="submit">Save profile</button>
+</form>
+
+<section class="card" style="margin-top:1rem">
+  <h2>Target tracks</h2>
+  <p class="muted">Example: Software, Embedded/Systems, Test/Validation. Each can have different skills and a different pitch.</p>
+  {% for track in profile.tracks.all %}
+    <p>
+      <a href="{% url 'track_edit' track.pk %}">{{ track.name }}</a>
+      {% if track.is_default %}<span class="badge">Default</span>{% endif %}
+      · {{ track.profile_skills.count }} skills
+    </p>
+  {% empty %}
+    <div class="empty">Add at least two tracks so matching can recommend one.</div>
+  {% endfor %}
+  <form method="post" action="{% url 'track_create' %}">
+    {% csrf_token %}
+    {{ track_form.as_p }}
+    <button class="btn" type="submit">Add track</button>
+  </form>
+</section>
+
+<div class="split" style="margin-top:1rem">
+  <section class="card">
+    <h2>Experience, coursework, certifications</h2>
+    {% for item in profile.experiences.all %}
+      <p>{{ item.title }} · {{ item.organization }} <a href="{% url 'experience_delete' item.pk %}">Remove</a></p>
+    {% endfor %}
+    <form method="post" action="{% url 'experience_create' %}">{% csrf_token %}{{ experience_form.as_p }}<button class="btn secondary" type="submit">Add</button></form>
+  </section>
+  <section class="card">
+    <h2>Projects</h2>
+    {% for item in profile.projects.all %}
+      <p>{{ item.name }} {% if item.url %}<a href="{{ item.url }}">link</a>{% endif %} <a href="{% url 'project_delete' item.pk %}">Remove</a></p>
+    {% endfor %}
+    <form method="post" action="{% url 'project_create' %}">{% csrf_token %}{{ project_form.as_p }}<button class="btn secondary" type="submit">Add</button></form>
+  </section>
+</div>
+{% endblock %}

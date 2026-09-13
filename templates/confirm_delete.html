@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}Confirm delete{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Delete {{ object }}?</h1>
+  <form method="post">{% csrf_token %}<button class="btn danger" type="submit">Delete</button> <a class="btn ghost" href="javascript:history.back()">Cancel</a></form>
+</section>
+{% endblock %}

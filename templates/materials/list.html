@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Materials{% endblock %}
+{% block content %}
+<h1>Application materials</h1>
+<p class="lede">Label resume versions by track. When you apply, snapshot the versions you used.</p>
+<form method="post" enctype="multipart/form-data" class="card">
+  {% csrf_token %}
+  {{ form.as_p }}
+  <button class="btn" type="submit">Save material</button>
+</form>
+<table>
+  <thead><tr><th>Name</th><th>Type</th><th>Track</th><th>Created</th><th></th></tr></thead>
+  <tbody>
+    {% for material in materials %}
+      <tr>
+        <td>{{ material.name }}</td>
+        <td>{{ material.get_material_type_display }}</td>
+        <td>{{ material.track.name|default:"—" }}</td>
+        <td>{{ material.created_at|date:"M j, Y" }}</td>
+        <td>
+          {% if material.file %}<a href="{% url 'material_download' material.pk %}">Download</a>{% endif %}
+          {% if material.link %}<a href="{{ material.link }}">Link</a>{% endif %}
+          <a href="{% url 'material_delete' material.pk %}">Delete</a>
+        </td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="5">Upload a general career-fair resume and a specialized systems resume to compare later.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block content %}
+<section class="card auth-card">
+  <h1>Sign in</h1>
+  <p class="lede">Your applications, materials, and follow-ups stay on this desk.</p>
+  <form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button class="btn" type="submit">Sign in</button>
+  </form>
+  <p><a href="{% url 'password_reset' %}">Forgot password?</a> · <a href="{% url 'register' %}">Create an account</a></p>
+</section>
+{% endblock %}

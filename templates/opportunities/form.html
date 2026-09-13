@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}{% if mode == 'edit' %}Edit role{% else %}Add a role{% endif %}{% endblock %}
+{% block content %}
+<h1>{% if mode == 'edit' %}Edit role{% else %}Add a role{% endif %}</h1>
+<p class="lede">Title, company, URL, and description are enough to start. Everything else can wait.</p>
+{% if duplicates %}
+  <section class="card">
+    <h2>Possible duplicates</h2>
+    <p>These look similar. Continue only if this is a distinct posting.</p>
+    <ul>
+      {% for dup in duplicates %}
+        <li><a href="{% url 'opportunity_detail' dup.pk %}">{{ dup.title }} at {{ dup.company }}</a></li>
+      {% endfor %}
+    </ul>
+  </section>
+{% endif %}
+<form method="post" class="card">
+  {% csrf_token %}
+  {% if duplicates %}<input type="hidden" name="confirm_duplicate" value="1">{% endif %}
+  <div class="form-grid">
+    <div>{{ form.title.label_tag }}{{ form.title }}</div>
+    <div>{{ form.company.label_tag }}{{ form.company }}</div>
+    <div class="span-2">{{ form.url.label_tag }}{{ form.url }}</div>
+    <div class="span-2">{{ form.description.label_tag }}{{ form.description }}</div>
+    <div>{{ form.selected_track.label_tag }}{{ form.selected_track }}</div>
+    <div>{{ form.priority.label_tag }}{{ form.priority }}</div>
+  </div>
+  <details class="panel" style="margin-top:1rem">
+    <summary>More fields</summary>
+    <div class="form-grid">
+      <div>{{ form.source.label_tag }}{{ form.source }}</div>
+      <div>{{ form.location.label_tag }}{{ form.location }}</div>
+      <div>{{ form.work_arrangement.label_tag }}{{ form.work_arrangement }}</div>
+      <div>{{ form.role_type.label_tag }}{{ form.role_type }}</div>
+      <div>{{ form.posting_date.label_tag }}{{ form.posting_date }}</div>
+      <div>{{ form.deadline.label_tag }}{{ form.deadline }}</div>
+      <div>{{ form.sponsorship_status.label_tag }}{{ form.sponsorship_status }}<p class="help">Leave unknown unless you verified it. The app will not claim a company sponsors you.</p></div>
+      <div>{{ form.salary.label_tag }}{{ form.salary }}</div>
+      <div class="span-2">{{ form.required_skills_text.label_tag }}{{ form.required_skills_text }}</div>
+      <div class="span-2">{{ form.preferred_skills_text.label_tag }}{{ form.preferred_skills_text }}</div>
+      <div class="span-2">{{ form.degree_requirements.label_tag }}{{ form.degree_requirements }}</div>
+      <div class="span-2">{{ form.experience_requirements.label_tag }}{{ form.experience_requirements }}</div>
+      <div class="span-2">{{ form.notes.label_tag }}{{ form.notes }}</div>
+      <div class="span-2">{{ form.priority_override_reason.label_tag }}{{ form.priority_override_reason }}</div>
+    </div>
+  </details>
+  <p class="row" style="margin-top:1rem">
+    <button class="btn" type="submit">{% if duplicates %}Save anyway{% else %}Save{% endif %}</button>
+    <a class="btn ghost" href="{% url 'opportunity_list' %}">Cancel</a>
+  </p>
+</form>
+{% endblock %}

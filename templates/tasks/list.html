@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Tasks{% endblock %}
+{% block content %}
+<div class="row space">
+  <h1>Tasks and follow-ups</h1>
+  <a class="btn ghost" href="?open=1">Open only</a>
+</div>
+<form method="post" class="card">{% csrf_token %}{{ form.as_p }}<button class="btn" type="submit">Add task</button></form>
+<table>
+  <thead><tr><th>Task</th><th>Due</th><th>Type</th><th>Opportunity</th><th></th></tr></thead>
+  <tbody>
+    {% for task in tasks %}
+      <tr>
+        <td>{% if task.completed %}<s>{{ task.title }}</s>{% else %}{{ task.title }}{% endif %}</td>
+        <td>{{ task.due_date|default:"—" }}</td>
+        <td>{{ task.get_task_type_display }}</td>
+        <td>{% if task.opportunity %}<a href="{% url 'opportunity_detail' task.opportunity_id %}">{{ task.opportunity.company }}</a>{% endif %}</td>
+        <td>
+          <form method="post" action="{% url 'task_toggle' task.pk %}" style="display:inline">{% csrf_token %}<button class="btn ghost" type="submit">{% if task.completed %}Undo{% else %}Complete{% endif %}</button></form>
+          <a href="{% url 'task_delete' task.pk %}">Delete</a>
+        </td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="5">Create a follow-up when you apply, for example “Check portal in 7 days”.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

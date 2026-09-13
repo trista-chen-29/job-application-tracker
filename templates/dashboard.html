@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<h1>What should I do next?</h1>
+<p class="lede">Overdue follow-ups first, then deadlines, then strong matches you have not applied to.</p>
+
+<section class="grid cards">
+  <article class="card"><h3>Applied this week</h3><p style="font-size:2rem;margin:0">{{ applied_this_week }}</p></article>
+  <article class="card"><h3>Applied this month</h3><p style="font-size:2rem;margin:0">{{ applied_this_month }}</p></article>
+  <article class="card"><h3>Overdue follow-ups</h3><p style="font-size:2rem;margin:0">{{ overdue_followups }}</p></article>
+  <article class="card"><h3>Upcoming interviews</h3><p style="font-size:2rem;margin:0">{{ upcoming_interviews }}</p></article>
+  <article class="card"><h3>Needs action</h3><p style="font-size:2rem;margin:0">{{ needs_action }}</p></article>
+  <article class="card"><h3>Strong, not applied</h3><p style="font-size:2rem;margin:0">{{ strong_unapplied }}</p></article>
+</section>
+
+<div class="split" style="margin-top:1rem">
+  <section class="card">
+    <div class="row space"><h2>Overdue and open tasks</h2><a class="btn secondary" href="{% url 'tasks' %}">All tasks</a></div>
+    {% if open_tasks %}
+      <ul>
+        {% for task in open_tasks %}
+          <li>
+            {% if task.due_date and task.due_date < today %}<span class="badge overdue">Overdue</span>{% endif %}
+            {{ task.title }}
+            {% if task.opportunity %} · <a href="{% url 'opportunity_detail' task.opportunity_id %}">{{ task.opportunity.company }}</a>{% endif %}
+            {% if task.due_date %}<span class="muted"> due {{ task.due_date }}</span>{% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <div class="empty">No open tasks. After you save a role, add a follow-up such as “Tailor resume bullets by Friday”.</div>
+    {% endif %}
+    <h2>Next deadlines</h2>
+    {% for opp in next_deadlines %}
+      <p><a href="{% url 'opportunity_detail' opp.pk %}">{{ opp.title }}</a> at {{ opp.company }} · {{ opp.deadline }}</p>
+    {% empty %}
+      <p class="muted">No upcoming deadlines recorded.</p>
+    {% endfor %}
+  </section>
+  <section class="card">
+    <div class="row space"><h2>Recent opportunities</h2><a class="btn" href="{% url 'opportunity_create' %}">Add a role</a></div>
+    {% for opp in recent %}
+      <p>
+        <a href="{% url 'opportunity_detail' opp.pk %}">{{ opp.title }}</a><br>
+        <span class="muted">{{ opp.company }} · {{ opp.get_status_display }}</span>
+        <span class="badge {{ opp.match_category }}">{{ opp.get_match_category_display }}</span>
+      </p>
+    {% empty %}
+      <div class="empty">Add a job with title, company, URL, and a pasted description. Example: “Firmware intern, Acme Robotics”.</div>
+    {% endfor %}
+  </section>
+</div>
+{% endblock %}

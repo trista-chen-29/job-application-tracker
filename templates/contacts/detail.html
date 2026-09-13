@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}{{ contact.name }}{% endblock %}
+{% block content %}
+<h1>{{ contact.name }}</h1>
+<form method="post" class="card">{% csrf_token %}{{ form.as_p }}<button class="btn" type="submit">Save contact</button></form>
+<section class="card">
+  <h2>Interactions</h2>
+  {% for item in contact.interactions.all %}
+    <p>{{ item.occurred_on }} · {{ item.channel }}<br>{{ item.notes }}</p>
+  {% endfor %}
+  <form method="post">
+    {% csrf_token %}
+    <input type="hidden" name="intent" value="interaction">
+    {{ interaction_form.as_p }}
+    <button class="btn secondary" type="submit">Log interaction</button>
+  </form>
+</section>
+<p><a href="{% url 'contact_delete' contact.pk %}">Delete contact</a></p>
+{% endblock %}

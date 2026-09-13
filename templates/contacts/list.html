@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Contacts{% endblock %}
+{% block content %}
+<h1>Networking and contacts</h1>
+<p class="lede">Record recruiters, alumni, and career-fair conversations. Templates are for you to copy; nothing is sent automatically.</p>
+<div class="split">
+  <section>
+    {% for contact in contacts %}
+      <article class="card">
+        <h3><a href="{% url 'contact_detail' contact.pk %}">{{ contact.name }}</a></h3>
+        <p class="muted">{{ contact.organization }} · {{ contact.get_relationship_display }}</p>
+        <p>Next follow-up: {{ contact.next_follow_up|default:"—" }}</p>
+      </article>
+    {% empty %}
+      <div class="empty">Add a recruiter after a career fair: name, company, and a follow-up date.</div>
+    {% endfor %}
+  </section>
+  <section class="grid">
+    <form method="post" class="card">{% csrf_token %}{{ form.as_p }}<button class="btn" type="submit">Save contact</button></form>
+    <form method="post" action="{% url 'template_create' %}" class="card">
+      {% csrf_token %}
+      <h2>Reusable message templates</h2>
+      {{ template_form.as_p }}
+      <button class="btn secondary" type="submit">Save template</button>
+      {% for template in templates %}
+        <details><summary>{{ template.name }}</summary><pre style="white-space:pre-wrap;font:inherit">{{ template.body }}</pre><a href="{% url 'template_delete' template.pk %}">Delete</a></details>
+      {% endfor %}
+    </form>
+  </section>
+</div>
+{% endblock %}

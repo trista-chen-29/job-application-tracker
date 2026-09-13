@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Edit track{% endblock %}
+{% block content %}
+<h1>Edit {{ track.name }}</h1>
+<form method="post" class="card">{% csrf_token %}{{ form.as_p }}<button class="btn" type="submit">Save track</button></form>
+<p><a href="{% url 'track_delete' track.pk %}">Delete track</a></p>
+{% endblock %}

@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Account{% endblock %}
+{% block content %}
+<h1>Account</h1>
+<p>Signed in as {{ user.username }} ({{ user.email }}).</p>
+<form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="btn secondary" type="submit">Log out</button></form>
+<section class="card">
+  <h2>Delete account</h2>
+  <p>This removes your profile, opportunities, files, and notes. Type DELETE to confirm.</p>
+  <form method="post">{% csrf_token %}<input class="input" name="confirm" placeholder="DELETE"><button class="btn danger" type="submit">Delete my data</button></form>
+</section>
+{% endblock %}

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Import and export{% endblock %}
+{% block content %}
+<h1>Import and export</h1>
+<p class="lede">CSV for spreadsheets, JSON for a full backup, Markdown for a single-role prep brief.</p>
+<section class="card">
+  <h2>Import opportunities CSV</h2>
+  <p class="muted">Required columns: title, company. Optional: url, status, location, source, description.</p>
+  <form method="post" enctype="multipart/form-data">
+    {% csrf_token %}
+    <input type="file" name="csv_file" accept=".csv" required>
+    <button class="btn" type="submit">Import</button>
+  </form>
+</section>
+<section class="card">
+  <h2>Export</h2>
+  <p class="row">
+    <a class="btn secondary" href="{% url 'export_download' 'opportunities' %}">Opportunities CSV</a>
+    <a class="btn secondary" href="{% url 'export_download' 'contacts' %}">Contacts CSV</a>
+    <a class="btn secondary" href="{% url 'export_download' 'tasks' %}">Tasks CSV</a>
+    <a class="btn secondary" href="{% url 'export_download' 'status-history' %}">Status history CSV</a>
+    <a class="btn" href="{% url 'export_download' 'json' %}">Full JSON</a>
+  </p>
+</section>
+{% endblock %}

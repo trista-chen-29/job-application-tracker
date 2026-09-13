@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Analytics{% endblock %}
+{% block content %}
+<h1>Search metrics</h1>
+<p class="lede">{{ explanation }}</p>
+<form class="row" method="get">
+  <label>From <input class="input" type="date" name="start" value="{{ start }}"></label>
+  <label>To <input class="input" type="date" name="end" value="{{ end }}"></label>
+  <button class="btn" type="submit">Filter range</button>
+</form>
+<section class="grid cards">
+  <article class="card"><h3>Response rate</h3><p>{{ response_rate.label }}</p><p class="muted">{{ response_rate.explanation }}</p></article>
+  <article class="card"><h3>Interview conversion</h3><p>{{ interview_rate.label }}</p><p class="muted">{{ interview_rate.explanation }}</p></article>
+  <article class="card"><h3>Offer conversion</h3><p>{{ offer_rate.label }}</p><p class="muted">{{ offer_rate.explanation }}</p></article>
+</section>
+<section class="card">
+  <h2>By status</h2>
+  <ul>
+    {% for row in status_rows %}
+      <li>{{ row.label }}: {{ row.total }}</li>
+    {% endfor %}
+  </ul>
+</section>
+<section class="card">
+  <h2>By source</h2>
+  <ul>{% for row in by_source %}<li>{{ row.source }}: {{ row.total }}</li>{% empty %}<li>No data yet.</li>{% endfor %}</ul>
+  <h2>By track</h2>
+  <ul>{% for row in by_track %}<li>{{ row.selected_track__name|default:"No track" }}: {{ row.total }}</li>{% empty %}<li>No data yet.</li>{% endfor %}</ul>
+  <h2>By resume version</h2>
+  <ul>{% for row in by_resume %}<li>{{ row.application__material_snapshots__name }}: {{ row.total }}</li>{% empty %}<li>No resume snapshots yet.</li>{% endfor %}</ul>
+</section>
+{% endblock %}

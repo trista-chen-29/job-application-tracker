@@ -1,0 +1,187 @@
+{% extends "base.html" %}
+{% block title %}{{ opportunity.title }}{% endblock %}
+{% block content %}
+<div class="row space">
+  <div>
+    <p class="muted">{{ opportunity.company }} · {{ opportunity.get_role_type_display }} · {{ opportunity.get_source_display }}</p>
+    <h1>{{ opportunity.title }}</h1>
+    <p>
+      <span class="badge {{ opportunity.match_category }}">{{ opportunity.get_match_category_display }}</span>
+      <span class="badge {{ opportunity.priority }}">{{ opportunity.get_priority_display }} priority</span>
+      {% if opportunity.deadline %}Deadline {{ opportunity.deadline }}{% endif %}
+      {% if opportunity.url %} · <a href="{{ opportunity.url }}" rel="noopener" target="_blank">Job posting</a>{% endif %}
+    </p>
+  </div>
+  <div class="row">
+    <a class="btn secondary" href="{% url 'opportunity_edit' opportunity.pk %}">Edit</a>
+    <a class="btn ghost" href="{% url 'opportunity_brief' opportunity.pk %}">Export brief</a>
+  </div>
+</div>
+
+<div class="split">
+  <div class="grid">
+    <section class="card">
+      <h2>Status</h2>
+      <form method="post" action="{% url 'opportunity_status' opportunity.pk %}" class="row">
+        {% csrf_token %}
+        {{ status_form.status }}
+        {{ status_form.note }}
+        <button class="btn" type="submit">Update status</button>
+      </form>
+      <p class="muted">Every change is timestamped. Applied is recorded the first time you move into or past Applied.</p>
+      <ul>
+        {% for event in opportunity.status_history.all %}
+          <li>{{ event.changed_at }}: {{ event.from_status|default:"new" }} → {{ event.to_status }} {% if event.note %}({{ event.note }}){% endif %}</li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="card match-block">
+      <h2>Match summary</h2>
+      <p>{% if opportunity.match_score is not None %}{{ opportunity.match_score|floatformat:0 }}/100{% else %}Not scored{% endif %}</p>
+      <p>{{ opportunity.match_payload.why }}</p>
+      <p class="muted">Recommended track: {{ opportunity.match_payload.recommended_track }}</p>
+      {% if opportunity.match_payload.blockers %}
+        <h3>Potential blockers</h3>
+        <ul>{% for item in opportunity.match_payload.blockers %}<li>{{ item }}</li>{% endfor %}</ul>
+      {% endif %}
+      <h3>Strengths</h3>
+      <ul>{% for item in opportunity.match_payload.strengths %}<li>{{ item }}</li>{% empty %}<li class="muted">No overlapping strengths recorded yet.</li>{% endfor %}</ul>
+      <h3>Missing or uncertain</h3>
+      <ul>
+        {% for item in opportunity.match_payload.missing %}<li>{{ item }}</li>{% endfor %}
+        {% for item in opportunity.match_payload.uncertain %}<li>{{ item }}</li>{% endfor %}
+      </ul>
+      {% if opportunity.match_payload.suggested_keywords %}
+        <h3>Suggested keywords</h3>
+        <p class="muted">Only shown when the posting and your profile both support them.</p>
+        <ul>{% for item in opportunity.match_payload.suggested_keywords %}<li>{{ item }}</li>{% endfor %}</ul>
+      {% endif %}
+      {% for component in opportunity.match_payload.components %}
+        <div class="component">
+          <strong>{{ component.label }}</strong>
+          {% if component.included %} · {{ component.score }}{% else %} · omitted{% endif %}
+          <p class="muted">{{ component.explanation }}</p>
+        </div>
+      {% endfor %}
+    </section>
+
+    <section class="card">
+      <h2>Checklist</h2>
+      <ul class="checklist">
+        {% for item in opportunity.checklist_items.all %}
+          {% include "opportunities/_checklist_item.html" %}
+        {% endfor %}
+      </ul>
+      <form method="post" action="{% url 'checklist_add' opportunity.pk %}" class="row">
+        {% csrf_token %}
+        <input class="input" name="label" placeholder="Custom checklist item">
+        <button class="btn secondary" type="submit">Add</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Application materials used</h2>
+      <form method="post" action="{% url 'opportunity_materials' opportunity.pk %}">
+        {% csrf_token %}
+        {% for material in materials %}
+          <label><input type="checkbox" name="materials" value="{{ material.pk }}" {% if material.pk in selected_material_ids %}checked{% endif %}> {{ material.name }} ({{ material.get_material_type_display }})</label>
+        {% empty %}
+          <p class="muted">Upload a resume version in Materials first.</p>
+        {% endfor %}
+        <p><button class="btn" type="submit">Snapshot selected versions</button></p>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Job description</h2>
+      <pre style="white-space:pre-wrap;font:inherit">{{ opportunity.description|default:"No description saved." }}</pre>
+    </section>
+  </div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Follow-up task</h2>
+      <form method="post" action="{% url 'tasks' %}">
+        {% csrf_token %}
+        <input type="hidden" name="next" value="{% url 'opportunity_detail' opportunity.pk %}">
+        {{ task_form.as_p }}
+        <button class="btn" type="submit">Add task</button>
+      </form>
+      <ul>
+        {% for task in opportunity.tasks.all %}
+          <li>
+            <form method="post" action="{% url 'task_toggle' task.pk %}" style="display:inline">{% csrf_token %}<input type="hidden" name="next" value="{% url 'opportunity_detail' opportunity.pk %}"><button class="btn ghost" type="submit">{% if task.completed %}Undo{% else %}Done{% endif %}</button></form>
+            {{ task.title }} {% if task.due_date %}· {{ task.due_date }}{% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>Contacts</h2>
+      <form method="post" action="{% url 'contacts' %}">
+        {% csrf_token %}
+        <input type="hidden" name="next" value="{% url 'opportunity_detail' opportunity.pk %}">
+        {{ contact_form.as_p }}
+        <button class="btn" type="submit">Add contact</button>
+      </form>
+      {% for contact in opportunity.contacts.all %}
+        <p><a href="{% url 'contact_detail' contact.pk %}">{{ contact.name }}</a> · {{ contact.get_relationship_display }}</p>
+      {% endfor %}
+      {% if templates %}
+        <h3>Message templates</h3>
+        <p class="muted">Review and send these yourself. The app does not send messages.</p>
+        {% for template in templates %}
+          <details><summary>{{ template.name }}</summary><pre style="white-space:pre-wrap;font:inherit">{{ template.body }}</pre></details>
+        {% endfor %}
+      {% endif %}
+    </section>
+
+    <section class="card">
+      <h2>Interviews</h2>
+      <form method="post" action="{% url 'interview_create' opportunity.pk %}">
+        {% csrf_token %}
+        {{ interview_form.as_p }}
+        <button class="btn" type="submit">Add stage</button>
+      </form>
+      {% for stage in opportunity.interview_stages.all %}
+        <article>
+          <h3>{{ stage.stage_name }}</h3>
+          <p class="muted">{{ stage.scheduled_at|default:"Date TBD" }} · {{ stage.format }}</p>
+          <p>{{ stage.interviewer_names }} {% if stage.thank_you_sent %}· thank-you sent{% endif %}</p>
+          {% for note in stage.notes.all %}
+            <p><strong>{{ note.get_note_type_display }}:</strong> {{ note.content }}</p>
+          {% endfor %}
+          <form method="post" action="{% url 'interview_note' opportunity.pk stage.pk %}">
+            {% csrf_token %}
+            <select name="note_type" class="input select">
+              <option value="topics">Topics</option>
+              <option value="technical">Technical</option>
+              <option value="behavioral">Behavioral</option>
+              <option value="ask_employer">Questions to ask</option>
+              <option value="star">STAR examples</option>
+              <option value="general">Notes</option>
+            </select>
+            <textarea name="content" class="input textarea" placeholder="Preparation note"></textarea>
+            <button class="btn secondary" type="submit">Save note</button>
+          </form>
+        </article>
+      {% endfor %}
+    </section>
+
+    {% if duplicates %}
+      <section class="card">
+        <h2>Possible duplicates</h2>
+        {% for dup in duplicates %}<p><a href="{% url 'opportunity_detail' dup.pk %}">{{ dup.title }} at {{ dup.company }}</a></p>{% endfor %}
+      </section>
+    {% endif %}
+
+    <section class="card">
+      <form method="post" action="{% url 'opportunity_duplicate' opportunity.pk %}">{% csrf_token %}<button class="btn secondary" type="submit">Duplicate</button></form>
+      <form method="post" action="{% url 'opportunity_archive' opportunity.pk %}">{% csrf_token %}<button class="btn ghost" type="submit">{% if opportunity.is_archived %}Unarchive{% else %}Archive{% endif %}</button></form>
+      <p><a href="{% url 'opportunity_delete' opportunity.pk %}">Delete</a></p>
+    </section>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Opportunities{% endblock %}
+{% block content %}
+<div class="row space">
+  <div>
+    <h1>Opportunities</h1>
+    <p class="lede">Filter the pipeline without leaving this table.</p>
+  </div>
+  <div class="row">
+    <a class="btn secondary" href="{% url 'opportunity_board' %}">Board view</a>
+    <a class="btn" href="{% url 'opportunity_create' %}">Add a role</a>
+  </div>
+</div>
+<form class="card" method="get" style="margin-bottom:1rem">
+  <div class="form-grid">
+    <div class="span-2">{{ form.q }}</div>
+    <div>{{ form.status }}</div>
+    <div>{{ form.match_category }}</div>
+    <div>{{ form.priority }}</div>
+    <div>{{ form.source }}</div>
+    <div>{{ form.work_arrangement }}</div>
+    <div>{{ form.sponsorship_status }}</div>
+    <div>{{ form.track }}</div>
+  </div>
+  <p class="row"><button class="btn" type="submit">Filter</button><a class="btn ghost" href="{% url 'opportunity_list' %}">Reset</a></p>
+</form>
+{% if opportunities %}
+<table>
+  <thead>
+    <tr><th>Role</th><th>Status</th><th>Match</th><th>Priority</th><th>Deadline</th><th>Source</th></tr>
+  </thead>
+  <tbody>
+    {% for opp in opportunities %}
+      <tr>
+        <td><a href="{% url 'opportunity_detail' opp.pk %}">{{ opp.title }}</a><br><span class="muted">{{ opp.company }} · {{ opp.location }}</span></td>
+        <td>{{ opp.get_status_display }}</td>
+        <td><span class="badge {{ opp.match_category }}">{{ opp.get_match_category_display }}</span></td>
+        <td><span class="badge {{ opp.priority }}">{{ opp.get_priority_display }}</span></td>
+        <td>{{ opp.deadline|default:"—" }}</td>
+        <td>{{ opp.get_source_display }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+  <div class="empty">No opportunities match those filters. Add one from a career page by pasting the description — you only need title, company, URL, and text to start.</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,39 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Job tracker{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'css/app.css' %}">
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</head>
+<body hx-headers='{"X-CSRFToken": "{{ csrf_token }}"}'>
+  <header class="topbar">
+    <a class="brand" href="{% url 'dashboard' %}">Application desk</a>
+    {% if user.is_authenticated %}
+      <nav class="nav">
+        <a href="{% url 'dashboard' %}">Dashboard</a>
+        <a href="{% url 'opportunity_list' %}">Opportunities {% if nav_active %}<span class="badge">{{ nav_active }}</span>{% endif %}</a>
+        <a href="{% url 'opportunity_board' %}">Pipeline</a>
+        <a href="{% url 'tasks' %}">Tasks {% if nav_overdue %}<span class="badge overdue">{{ nav_overdue }} overdue</span>{% endif %}</a>
+        <a href="{% url 'contacts' %}">Contacts</a>
+        <a href="{% url 'materials' %}">Materials</a>
+        <a href="{% url 'profile' %}">Profile</a>
+        <a href="{% url 'analytics' %}">Analytics</a>
+        <a href="{% url 'import_export' %}">Import/Export</a>
+        <a href="{% url 'account' %}">{{ user.username }}</a>
+        <form method="post" action="{% url 'logout' %}" style="display:inline">{% csrf_token %}<button class="btn ghost" type="submit">Log out</button></form>
+      </nav>
+    {% endif %}
+  </header>
+  <main class="shell">
+    {% if messages %}
+      <ul class="flash">
+        {% for message in messages %}<li>{{ message }}</li>{% endfor %}
+      </ul>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

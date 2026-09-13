@@ -1,0 +1,5 @@
+Django>=6.1,<7
+django-htmx>=1.29
+python-dotenv>=1.0
+# Optional production database driver:
+# psycopg[binary]>=3.2

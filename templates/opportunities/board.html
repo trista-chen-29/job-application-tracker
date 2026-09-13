@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Pipeline{% endblock %}
+{% block content %}
+<div class="row space">
+  <h1>Pipeline</h1>
+  <a class="btn" href="{% url 'opportunity_create' %}">Add a role</a>
+</div>
+<p class="lede">Status names are shown on each column so color is not the only signal.</p>
+<div class="board">
+  {% for column in columns %}
+    <section class="column">
+      <h3>{{ column.label }} ({{ column.items|length }})</h3>
+      {% for opp in column.items %}
+        <article class="opp-card">
+          <a href="{% url 'opportunity_detail' opp.pk %}">{{ opp.title }}</a>
+          <p class="muted">{{ opp.company }}</p>
+          <span class="badge {{ opp.match_category }}">{{ opp.get_match_category_display }}</span>
+          <form method="post" action="{% url 'opportunity_status' opp.pk %}" style="margin-top:0.4rem">
+            {% csrf_token %}
+            <input type="hidden" name="next" value="{% url 'opportunity_board' %}">
+            <select name="status" class="input select" onchange="this.form.submit()">
+              {% for value, label in status_form.fields.status.choices %}
+                <option value="{{ value }}" {% if value == opp.status %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+            <input type="hidden" name="note" value="">
+          </form>
+        </article>
+      {% empty %}
+        <p class="muted">Empty</p>
+      {% endfor %}
+    </section>
+  {% endfor %}
+</div>
+{% endblock %}
