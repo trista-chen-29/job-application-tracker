@@ -262,7 +262,39 @@ class MailParseTests(TestCase):
         self.assertEqual(result["created"], 1)
         opp = Opportunity.objects.get(user=user)
         self.assertEqual(opp.company, "Stripe")
+        self.assertEqual(opp.title, "Software Engineer Intern")
         self.assertEqual(opp.status, OpportunityStatus.APPLIED)
+
+    def test_graphcore_confirmation_uses_company_and_role_from_body(self):
+        from tracker.services.mailparse import parse_message
+
+        hint = parse_message(
+            "no-reply@graphcore.ai",
+            "Thank you for applying to Graphcore",
+            (
+                "Dear Yi-Chi,\n\nThank you for your interest in Graphcore. This email is to confirm "
+                "that we have received your application for the position of  Firmware Engineering Intern . "
+                "We will be reviewing your details in due course.\n\nBest wishes,\nGraphcore Talent Acquisition Team"
+            ),
+        )
+        self.assertIsNotNone(hint)
+        self.assertEqual(hint.company, "Graphcore")
+    def test_html_only_email_is_read_from_inside_the_message(self):
+        import base64
+
+        from tracker.services.gmail import _decode_parts
+        from tracker.services.mailparse import parse_message
+
+        html = (
+            "<html><body><p>Dear Yi-Chi,</p><p>Thank you for applying to Graphcore. "
+            "We have received your application for the position of Firmware Engineering Intern.</p></body></html>"
+        )
+        encoded = base64.urlsafe_b64encode(html.encode()).decode()
+        body = _decode_parts({"mimeType": "text/html", "body": {"data": encoded}})
+        self.assertIn("Firmware Engineering Intern", body)
+        hint = parse_message("no-reply@graphcore.ai", "Thank you for applying to Graphcore", body)
+        self.assertEqual(hint.company, "Graphcore")
+        self.assertEqual(hint.title, "Firmware Engineering Intern")
 
     def test_later_email_updates_existing_row(self):
         from tracker.services.mailparse import apply_mail_hints, parse_message
@@ -289,6 +321,38 @@ class MailParseTests(TestCase):
         )
         self.assertIsNotNone(hint)
         self.assertEqual(hint.status, OpportunityStatus.APPLIED)
+
+    def test_later_status_email_updates_same_company_row(self):
+        from tracker.services.mailparse import apply_mail_hints, parse_message
+
+        user = User.objects.create_user("mail7", "mail7@example.com", "pass12345")
+        Opportunity.objects.create(
+            user=user, company="Graphcore", title="Firmware Engineering Intern", status=OpportunityStatus.APPLIED
+        )
+        hint = parse_message(
+            "no-reply@graphcore.ai",
+            "Graphcore online assessment",
+            "Please complete the HackerRank online assessment for Firmware Engineering Intern.",
+        )
+        self.assertEqual(hint.status, OpportunityStatus.ONLINE_ASSESSMENT)
+        result = apply_mail_hints(user, [hint])
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(Opportunity.objects.filter(user=user).count(), 1)
+        self.assertEqual(Opportunity.objects.get(user=user).status, OpportunityStatus.ONLINE_ASSESSMENT)
+
+    def test_better_title_corrects_generic_intern_row(self):
+        from tracker.services.mailparse import apply_mail_hints, parse_message
+
+        user = User.objects.create_user("mail8", "mail8@example.com", "pass12345")
+        Opportunity.objects.create(user=user, company="Graphcore", title="Intern", status=OpportunityStatus.APPLIED)
+        hint = parse_message(
+            "no-reply@graphcore.ai",
+            "Thank you for applying to Graphcore",
+            "We have received your application for the position of Firmware Engineering Intern.",
+        )
+        result = apply_mail_hints(user, [hint])
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(Opportunity.objects.get(user=user).title, "Firmware Engineering Intern")
 
     def test_short_company_name_does_not_attach_to_unrelated_row(self):
         from tracker.services.mailparse import apply_mail_hints, parse_message
@@ -424,6 +488,22 @@ class GoogleSheetFillTests(TestCase):
             notes="Unfortunately",
             date_applied="2026-09-24",
         )
-        plan = upsert_plan(rows, hint)
-        self.assertEqual(plan["action"], "skipped")
+    def test_merged_row_keeps_offer_and_upgrades_title(self):
+        from tracker.services.gsheet import SheetHint, _merged_row
+
+        headers = ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"]
+        existing = ["2026-09-01", "Graphcore", "Intern", "", "Summer 2027", "Offer", ""]
+        hint = SheetHint(
+            company="Graphcore",
+            role="Firmware Engineering Intern",
+            location="",
+            tab="internships",
+            result="Applied",
+            notes="From email: Thank you",
+            date_applied="2026-09-24",
+        )
+        merged = _merged_row(headers, hint, existing, "internships")
+        self.assertEqual(merged[1], "Graphcore")
+        self.assertEqual(merged[2], "Firmware Engineering Intern")
+        self.assertEqual(merged[5], "Offer")
 

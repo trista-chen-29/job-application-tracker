@@ -109,16 +109,39 @@ def first_empty_company_row(rows: list[list[str]], company_col: int) -> int:
     return len(rows) + 1
 
 
-def find_company_row(rows: list[list[str]], company_col: int, company: str) -> int:
+def _role_tokens(role: str) -> set[str]:
+    stop = {"the", "a", "an", "of", "and", "for", "role", "position"}
+    return {part for part in normalize_company(role).split() if part and part not in stop}
+
+
+def find_company_row(rows: list[list[str]], company_col: int, company: str, role: str = "", role_col: int = -1) -> int:
     target = normalize_company(company)
-    found = 0
+    if not target:
+        return 0
+    hits: list[int] = []
     for index, row in enumerate(rows[1:], start=2):
         value = row[company_col] if company_col < len(row) else ""
-        if normalize_company(str(value)) == target and target:
-            if found:
-                return 0
-            found = index
-    return found
+        if normalize_company(str(value)) != target:
+            continue
+        hits.append(index)
+        if role and role_col >= 0:
+            current_role = row[role_col] if role_col < len(row) else ""
+            tokens = _role_tokens(role) & _role_tokens(str(current_role))
+            if current_role and (normalize_company(str(current_role)) == normalize_company(role) or len(tokens) >= 2):
+                return index
+    if len(hits) == 1:
+        return hits[0]
+    return 0
+
+
+def role_should_replace(current: str, nxt: str) -> bool:
+    now = (current or "").strip()
+    new = (nxt or "").strip()
+    if not new:
+        return False
+    if now.lower() in {"", "intern", "internship", "role"} and new.lower() not in {"intern", "internship"}:
+        return True
+    return len(new) > len(now) + 6
 
 
 def hint_from_mail(company: str, title: str, status: str, note: str, body: str = "", date_applied: str = "") -> SheetHint:
@@ -137,14 +160,17 @@ def upsert_plan(rows: list[list[str]], hint: SheetHint) -> dict:
     headers = rows[0] if rows else []
     company_col = header_index(headers, ("company",))
     result_col = header_index(headers, ("result", "status"))
+    role_col = header_index(headers, ("role", "title", "position"))
     if company_col < 0 or result_col < 0:
         return {"action": "skipped", "reason": "missing headers"}
-    match_row = find_company_row(rows, company_col, hint.company)
+    match_row = find_company_row(rows, company_col, hint.company, hint.role, role_col)
     if match_row:
-        current = rows[match_row - 1][result_col] if result_col < len(rows[match_row - 1]) else ""
-        if not should_advance(str(current), hint.result):
-            return {"action": "skipped", "row": match_row}
-        return {"action": "update", "row": match_row, "hint": hint}
+        row = rows[match_row - 1]
+        current = row[result_col] if result_col < len(row) else ""
+        current_role = row[role_col] if role_col >= 0 and role_col < len(row) else ""
+        if should_advance(str(current), hint.result) or role_should_replace(str(current_role), hint.role):
+            return {"action": "update", "row": match_row, "hint": hint}
+        return {"action": "skipped", "row": match_row}
     return {
         "action": "create",
         "row": first_empty_company_row(rows, company_col),
@@ -156,8 +182,10 @@ def _col_letter(index: int) -> str:
     return chr(ord("A") + index)
 
 
-def _write_row(service, spreadsheet_id: str, tab: str, row_number: int, headers: list[str], hint: SheetHint, existing: list[str] | None = None) -> None:
-    existing = existing or []
+def _merged_row(headers: list[str], hint: SheetHint, existing: list[str] | None, tab: str) -> list[str]:
+    existing = list(existing or [])
+    while len(existing) < len(headers):
+        existing.append("")
     mapping = {
         "date applied": hint.date_applied,
         "applied": hint.date_applied,
@@ -173,22 +201,52 @@ def _write_row(service, spreadsheet_id: str, tab: str, row_number: int, headers:
         "notes": hint.notes,
         "note": hint.notes,
     }
+    row = list(existing)
     for index, header in enumerate(headers):
         key = str(header or "").strip().lower()
         value = mapping.get(key, "")
-        if key in {"notes", "note"} and existing and index < len(existing) and value:
-            previous = str(existing[index] or "")
-            if value not in previous:
-                value = f"{value}\n{previous}".strip()
-        if not value:
+        current = str(row[index] or "")
+        if key in {"notes", "note"} and value:
+            if value not in current:
+                row[index] = f"{value}\n{current}".strip() if current else value
             continue
-        rng = f"'{tab}'!{_col_letter(index)}{row_number}"
-        service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=rng,
-            valueInputOption="USER_ENTERED",
-            body={"values": [[value]]},
-        ).execute()
+        if key in {"result", "status"}:
+            if should_advance(current, str(value)) or not current:
+                row[index] = value or current
+            continue
+        if key in {"role", "title", "position"}:
+            if role_should_replace(current, str(value)):
+                row[index] = value
+            elif not current and value:
+                row[index] = value
+            continue
+        if value and not current:
+            row[index] = value
+        elif key == "company" and value:
+            row[index] = value
+        elif key in {"date applied", "applied", "date"} and value and not current:
+            row[index] = value
+    return row
+
+
+def _sheets_execute(request):
+    import time
+
+    from googleapiclient.errors import HttpError
+
+    last_error = None
+    for attempt in range(6):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            last_error = exc
+            status = getattr(exc.resp, "status", None)
+            if status not in {429, 403}:
+                raise
+            if "RATE_LIMIT" not in str(exc) and "quota" not in str(exc).lower() and status != 429:
+                raise
+            time.sleep(20 + attempt * 15)
+    raise last_error
 
 
 def push_hints(creds, spreadsheet_id: str, hints: list[SheetHint]) -> dict:
@@ -203,13 +261,13 @@ def push_hints(creds, spreadsheet_id: str, hints: list[SheetHint]) -> dict:
     tabs = {hint.tab for hint in hints}
     grids: dict[str, list[list[str]]] = {}
     for tab in tabs:
-        payload = (
+        payload = _sheets_execute(
             service.spreadsheets()
             .values()
             .get(spreadsheetId=spreadsheet_id, range=f"'{tab}'!A1:G200")
-            .execute()
         )
         grids[tab] = payload.get("values") or [["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"]]
+    writes: list[dict] = []
     for hint in hints:
         plan = upsert_plan(grids[hint.tab], hint)
         action = plan["action"]
@@ -218,22 +276,24 @@ def push_hints(creds, spreadsheet_id: str, hints: list[SheetHint]) -> dict:
             continue
         row_number = plan["row"]
         headers = grids[hint.tab][0]
-        existing = grids[hint.tab][row_number - 1] if action == "update" and row_number <= len(grids[hint.tab]) else []
-        _write_row(service, spreadsheet_id, hint.tab, row_number, headers, hint, existing)
         while len(grids[hint.tab]) < row_number:
             grids[hint.tab].append([""] * max(len(headers), 7))
-        row = list(grids[hint.tab][row_number - 1])
-        while len(row) < len(headers):
-            row.append("")
-        company_col = header_index(headers, ("company",))
-        result_col = header_index(headers, ("result", "status"))
-        if company_col >= 0:
-            row[company_col] = hint.company
-        if result_col >= 0:
-            row[result_col] = hint.result
-        grids[hint.tab][row_number - 1] = row
+        existing = list(grids[hint.tab][row_number - 1])
+        merged = _merged_row(headers, hint, existing, hint.tab)
+        last_col = _col_letter(max(len(headers) - 1, 0))
+        writes.append({"range": f"'{hint.tab}'!A{row_number}:{last_col}{row_number}", "values": [merged]})
+        grids[hint.tab][row_number - 1] = merged
         if action == "create":
             created += 1
         else:
             updated += 1
+    if writes:
+        _sheets_execute(
+            service.spreadsheets()
+            .values()
+            .batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"valueInputOption": "USER_ENTERED", "data": writes},
+            )
+        )
     return {"created": created, "updated": updated, "skipped": skipped}

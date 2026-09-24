@@ -67,12 +67,13 @@ from tracker.services.gmail import (
     credentials_from_json,
     credentials_to_json,
     fetch_job_messages,
+    fetch_messages_by_ids,
     flow_for,
     gmail_configured,
     refresh_if_needed,
 )
 from tracker.services.gsheet import hint_from_mail, push_hints, spreadsheet_id_from_url
-from tracker.services.mailparse import apply_mail_hints, parse_message, parse_pasted_emails
+from tracker.services.mailparse import PARSER_VERSION, apply_mail_hints, parse_message, parse_pasted_emails
 from tracker.services.workflow import (
     change_status,
     duplicate_opportunity,
@@ -914,6 +915,8 @@ class GmailConnectView(LoginRequiredMixin, View):
             prompt="consent",
         )
         request.session["gmail_oauth_state"] = state
+        request.session["gmail_code_verifier"] = flow.code_verifier
+        request.session.save()
         return redirect(authorization_url)
 
 
@@ -925,6 +928,7 @@ class GmailCallbackView(LoginRequiredMixin, View):
 
         os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
         flow = flow_for(request)
+        flow.code_verifier = request.session.get("gmail_code_verifier")
         try:
             flow.fetch_token(authorization_response=request.build_absolute_uri())
         except Exception as exc:  # noqa: BLE001
@@ -963,18 +967,32 @@ class GmailSyncView(LoginRequiredMixin, View):
         try:
             creds = refresh_if_needed(credentials_from_json(account.token_json))
             account.token_json = credentials_to_json(creds)
-            raw_messages = fetch_job_messages(creds)
+            skip_ids = set(
+                GmailProcessedMessage.objects.filter(user=request.user).values_list("message_id", flat=True)
+            )
+            raw_messages = fetch_job_messages(creds, skip_ids=skip_ids, limit=25)
+            stale_ids = list(
+                GmailProcessedMessage.objects.filter(user=request.user, parser_version__lt=PARSER_VERSION)
+                .order_by("id")
+                .values_list("message_id", flat=True)[:20]
+            )
+            if stale_ids:
+                raw_messages.extend(fetch_messages_by_ids(creds, stale_ids))
         except Exception as exc:  # noqa: BLE001
             messages.error(request, f"Gmail sync failed ({exc}).")
             return redirect("gmail_connect")
         hints = []
         bodies: list[str] = []
         dates: list[str] = []
+        scanned = len(raw_messages)
         for item in raw_messages:
-            if GmailProcessedMessage.objects.filter(user=request.user, message_id=item["id"]).exists():
-                continue
             hint = parse_message(item["from"], item["subject"], item["body"], item["id"])
-            GmailProcessedMessage.objects.get_or_create(user=request.user, message_id=item["id"])
+            record, _created = GmailProcessedMessage.objects.get_or_create(
+                user=request.user, message_id=item["id"]
+            )
+            if record.parser_version != PARSER_VERSION:
+                record.parser_version = PARSER_VERSION
+                record.save(update_fields=["parser_version"])
             if hint:
                 hints.append(hint)
                 bodies.append(item.get("body") or "")
@@ -982,12 +1000,13 @@ class GmailSyncView(LoginRequiredMixin, View):
         result = apply_mail_hints(request.user, hints)
         sheet_result = None
         sheet_id = account.spreadsheet_id or request.session.get("spreadsheet_id") or getattr(settings, "GOOGLE_SHEET_ID", "")
-        if sheet_id and hints:
+        sheet_hints = [
+            hint_from_mail(hint.company, hint.title, hint.status, hint.note, body, date_applied)
+            for hint, body, date_applied in zip(hints, bodies, dates)
+        ]
+        if sheet_id:
+            sheet_hints.extend(_local_opportunity_hints(request.user))
             try:
-                sheet_hints = [
-                    hint_from_mail(hint.company, hint.title, hint.status, hint.note, body, date_applied)
-                    for hint, body, date_applied in zip(hints, bodies, dates)
-                ]
                 sheet_result = push_hints(creds, sheet_id, sheet_hints)
                 account.spreadsheet_id = sheet_id
             except Exception as exc:  # noqa: BLE001
@@ -999,9 +1018,99 @@ class GmailSyncView(LoginRequiredMixin, View):
             extra = f" Google Sheet: added {sheet_result['created']}, updated {sheet_result['updated']}."
         messages.success(
             request,
-            f"Gmail sync complete. {len(hints)} useful emails → added {result['created']}, updated {result['updated']}.{extra}",
+            f"Gmail sync complete. Read {scanned} messages."
+            f" {len(hints)} useful → added {result['created']}, updated {result['updated']}.{extra}"
+            f" New mail and status updates are applied to the same company row. Click Sync now again for the next batch.",
         )
         return redirect("home")
+
+
+class GmailRecheckView(LoginRequiredMixin, View):
+    def get(self, request):
+        return self.post(request)
+
+    def post(self, request):
+        account = GmailAccount.objects.filter(user=request.user).first()
+        if not account:
+            messages.info(request, "Connect Gmail first.")
+            return redirect("gmail_connect")
+        try:
+            creds = refresh_if_needed(credentials_from_json(account.token_json))
+            account.token_json = credentials_to_json(creds)
+            remaining = list(
+                GmailProcessedMessage.objects.filter(user=request.user, parser_version__lt=PARSER_VERSION)
+                .order_by("id")
+                .values_list("message_id", flat=True)[:30]
+            )
+            if not remaining:
+                messages.success(request, "All scraped emails have already been rechecked with the current parser.")
+                return redirect("gmail_connect")
+            raw_messages = fetch_messages_by_ids(creds, remaining, limit=30)
+        except Exception as exc:  # noqa: BLE001
+            messages.error(request, f"Gmail recheck failed ({exc}).")
+            return redirect("gmail_connect")
+        hints = []
+        bodies: list[str] = []
+        dates: list[str] = []
+        for item in raw_messages:
+            hint = parse_message(item["from"], item["subject"], item["body"], item["id"])
+            record, _created = GmailProcessedMessage.objects.get_or_create(
+                user=request.user, message_id=item["id"]
+            )
+            record.parser_version = PARSER_VERSION
+            record.save(update_fields=["parser_version"])
+            if hint:
+                hints.append(hint)
+                bodies.append(item.get("body") or "")
+                dates.append(_mail_date(item.get("date") or ""))
+        result = apply_mail_hints(request.user, hints)
+        sheet_result = None
+        sheet_id = account.spreadsheet_id or request.session.get("spreadsheet_id") or getattr(settings, "GOOGLE_SHEET_ID", "")
+        if sheet_id:
+            sheet_hints = [
+                hint_from_mail(hint.company, hint.title, hint.status, hint.note, body, date_applied)
+                for hint, body, date_applied in zip(hints, bodies, dates)
+            ]
+            sheet_hints.extend(_local_opportunity_hints(request.user))
+            try:
+                sheet_result = push_hints(creds, sheet_id, sheet_hints)
+                account.spreadsheet_id = sheet_id
+            except Exception as exc:  # noqa: BLE001
+                messages.error(request, f"Recheck read worked, but the Google Sheet update failed ({exc}).")
+        account.last_synced_at = timezone.now()
+        account.save(update_fields=["token_json", "last_synced_at", "spreadsheet_id"])
+        extra = ""
+        if sheet_result:
+            extra = f" Google Sheet: added {sheet_result['created']}, updated {sheet_result['updated']}."
+        leftover = GmailProcessedMessage.objects.filter(
+            user=request.user, parser_version__lt=PARSER_VERSION
+        ).count()
+        more = f" {leftover} older emails still queued — click Recheck again." if leftover else " All scraped emails have been rechecked."
+        messages.success(
+            request,
+            f"Rechecked {len(raw_messages)} scraped emails. Updated {result['updated']}, added {result['created']}.{extra}{more}",
+        )
+        return redirect("home")
+
+
+def _local_opportunity_hints(user):
+    from tracker.services.gsheet import hint_from_mail
+
+    hints = []
+    for opp in Opportunity.objects.filter(user=user, is_archived=False).select_related("application"):
+        applied = ""
+        if getattr(opp, "application", None) and opp.application.applied_at:
+            applied = timezone.localdate(opp.application.applied_at).isoformat()
+        hints.append(
+            hint_from_mail(
+                opp.company,
+                opp.title,
+                opp.status,
+                (opp.notes or "")[:180],
+                date_applied=applied,
+            )
+        )
+    return hints
 
 
 def _mail_date(raw: str) -> str:

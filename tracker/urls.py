@@ -48,6 +48,7 @@ urlpatterns = [
     path("gmail/", views.GmailConnectView.as_view(), name="gmail_connect"),
     path("gmail/callback/", views.GmailCallbackView.as_view(), name="gmail_callback"),
     path("gmail/sync/", views.GmailSyncView.as_view(), name="gmail_sync"),
+    path("gmail/recheck/", views.GmailRecheckView.as_view(), name="gmail_recheck"),
     path("gmail/disconnect/", views.GmailDisconnectView.as_view(), name="gmail_disconnect"),
     path("import-export/", views.ImportExportView.as_view(), name="import_export"),
     path("export/<str:kind>/", views.ExportDownloadView.as_view(), name="export_download"),

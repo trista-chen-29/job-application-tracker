@@ -11,10 +11,11 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 GMAIL_QUERY = (
-    "newer_than:30d "
+    "newer_than:730d "
     "(subject:application OR subject:applied OR subject:interview OR subject:assessment "
     "OR subject:hackerrank OR subject:codesignal OR subject:offer OR subject:unfortunately "
-    "OR from:recruiting OR from:careers OR from:talent OR from:university)"
+    "OR from:recruiting OR from:careers OR from:talent OR from:university "
+    "OR subject:\"thank you for applying\" OR subject:\"application received\")"
 )
 
 
@@ -74,38 +75,144 @@ def _header_map(payload: dict) -> dict[str, str]:
     return {item.get("name", "").lower(): item.get("value", "") for item in headers}
 
 
+def _html_to_text(html: str) -> str:
+    import re
+
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|tr|h1|h2|h3|li)>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    replacements = {"&nbsp;": " ", "&amp;": "&", "&#39;": "'", "&rsquo;": "'", "&ldquo;": '"', "&rdquo;": '"'}
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    return re.sub(r"[ \t]+", " ", text)
+
+
 def _decode_parts(payload: dict) -> str:
     import base64
 
-    chunks: list[str] = []
+    plain: list[str] = []
+    html: list[str] = []
 
     def walk(part: dict) -> None:
-        mime = part.get("mimeType", "")
+        mime = (part.get("mimeType") or "").lower()
         body = part.get("body") or {}
         data = body.get("data")
         if data and mime.startswith("text/"):
-            chunks.append(base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", errors="ignore"))
+            decoded = base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", errors="ignore")
+            if "html" in mime:
+                html.append(decoded)
+            else:
+                plain.append(decoded)
         for child in part.get("parts") or []:
             walk(child)
 
     walk(payload)
-    return "\n".join(chunks)[:8000]
+    plain_text = "\n".join(plain).strip()
+    html_text = _html_to_text("\n".join(html)).strip()
+    if len(plain_text) >= 80:
+        combined = plain_text
+        if "position of" not in plain_text.lower() and "position of" in html_text.lower():
+            combined = f"{plain_text}\n{html_text}"
+    else:
+        combined = "\n".join(part for part in (plain_text, html_text) if part)
+    return combined[:20000]
 
 
-def fetch_job_messages(creds, newer_than_days: int = 30) -> list[dict]:
+def _is_rate_limit(exc) -> bool:
+    text = str(exc).lower()
+    return "ratelimitexceeded" in text or "quota exceeded" in text or "usagelimits" in text
+
+
+def _gmail_execute(request, pause_seconds: float = 0.0):
+    import time
+
+    from googleapiclient.errors import HttpError
+
+    if pause_seconds:
+        time.sleep(pause_seconds)
+    last_error = None
+    for attempt in range(6):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            last_error = exc
+            if exc.resp.status not in {403, 429} or not _is_rate_limit(exc):
+                raise
+            time.sleep(20 + attempt * 15)
+    raise last_error
+
+
+def fetch_job_messages(creds, newer_than_days: int = 730, limit: int = 40, skip_ids: set[str] | None = None) -> list[dict]:
+    from googleapiclient.discovery import build
+
+    skip_ids = skip_ids or set()
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    query = GMAIL_QUERY.replace("730d", f"{newer_than_days}d")
+    ids: list[dict] = []
+    page_token = None
+    while len(ids) < 400:
+        kwargs = {
+            "userId": "me",
+            "q": query,
+            "maxResults": min(100, 400 - len(ids)),
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        try:
+            response = _gmail_execute(service.users().messages().list(**kwargs), pause_seconds=0.4)
+        except Exception:
+            break
+        ids.extend(response.get("messages") or [])
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    messages = []
+    for item in ids:
+        if item["id"] in skip_ids:
+            continue
+        try:
+            full = _gmail_execute(
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=item["id"],
+                    format="full",
+                ),
+                pause_seconds=1.3,
+            )
+        except Exception:
+            break
+        payload = full.get("payload") or {}
+        headers = _header_map(payload)
+        messages.append(
+            {
+                "id": full.get("id"),
+                "from": headers.get("from", ""),
+                "subject": headers.get("subject", ""),
+                "date": headers.get("date", ""),
+                "body": _decode_parts(payload) or full.get("snippet", ""),
+            }
+        )
+        if len(messages) >= limit:
+            break
+    return messages
+
+
+def fetch_messages_by_ids(creds, message_ids: list[str], limit: int = 15) -> list[dict]:
     from googleapiclient.discovery import build
 
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-    query = GMAIL_QUERY.replace("30d", f"{newer_than_days}d")
-    response = service.users().messages().list(userId="me", q=query, maxResults=50).execute()
     messages = []
-    for item in response.get("messages") or []:
-        full = (
-            service.users()
-            .messages()
-            .get(userId="me", id=item["id"], format="full")
-            .execute()
-        )
+    for message_id in message_ids[:limit]:
+        try:
+            full = _gmail_execute(
+                service.users().messages().get(userId="me", id=message_id, format="full"),
+                pause_seconds=1.3,
+            )
+        except Exception:
+            break
         payload = full.get("payload") or {}
         headers = _header_map(payload)
         messages.append(

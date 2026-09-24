@@ -10,7 +10,7 @@ const CONFIG = {
   newgradTab: 'newgrad',
   logTab: '_gmail_log',
   defaultSeason: 'Summer 2027',
-  lookbackDays: 180,
+  lookbackDays: 730,
 };
 
 const RESULT_RANK = {
@@ -25,6 +25,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Tracker')
     .addItem('Sync Gmail now', 'syncGmail')
+    .addItem('Recheck scraped mail', 'recheckScraped')
     .addItem('Install hourly sync', 'installHourlySync')
     .addToUi();
 }
@@ -32,7 +33,48 @@ function onOpen() {
 function installHourlySync() {
   ScriptApp.getProjectTriggers().forEach((trigger) => ScriptApp.deleteTrigger(trigger));
   ScriptApp.newTrigger('syncGmail').timeBased().everyHours(1).create();
-  SpreadsheetApp.getUi().alert('Hourly Gmail sync is on. Keep this spreadsheet and the Apps Script project.');
+  SpreadsheetApp.getActive().toast('Hourly Gmail sync is on.', 'Tracker', 8);
+}
+
+function recheckScraped() {
+  const ids = Object.keys(loadProcessedIds());
+  if (!ids.length) {
+    SpreadsheetApp.getActive().toast('Nothing scraped yet. Use Sync Gmail now first.', 'Tracker', 8);
+    return;
+  }
+  const props = PropertiesService.getDocumentProperties();
+  let start = parseInt(props.getProperty('recheckOffset') || '0', 10);
+  if (start >= ids.length) start = 0;
+  const batch = ids.slice(start, start + 30);
+  let created = 0;
+  let updated = 0;
+  let skipped = 0;
+  batch.forEach((id) => {
+    let message;
+    try {
+      message = GmailApp.getMessageById(id);
+    } catch (err) {
+      skipped += 1;
+      return;
+    }
+    const hint = parseMessage(message.getFrom(), message.getSubject(), fullMessageBody(message), message.getDate());
+    if (!hint) {
+      skipped += 1;
+      return;
+    }
+    const result = applyHint(hint);
+    if (result === 'created') created += 1;
+    else if (result === 'updated') updated += 1;
+    else skipped += 1;
+  });
+  props.setProperty('recheckOffset', String(start + batch.length));
+  const left = ids.length - (start + batch.length);
+  SpreadsheetApp.getActive().toast(
+    'Rechecked ' + batch.length + ': added ' + created + ', updated ' + updated + ', skipped ' + skipped +
+      (left > 0 ? '. Run Recheck again for ' + left + ' more.' : '. Done with scraped mail.'),
+    'Tracker',
+    10
+  );
 }
 
 function syncGmail() {
@@ -60,7 +102,7 @@ function syncGmail() {
       const hint = parseMessage(
         message.getFrom(),
         message.getSubject(),
-        message.getPlainBody() || '',
+        fullMessageBody(message),
         message.getDate()
       );
       markProcessed(id, message.getSubject());
@@ -81,6 +123,27 @@ function syncGmail() {
     'Gmail sync',
     8
   );
+}
+
+function fullMessageBody(message) {
+  const plain = message.getPlainBody() || '';
+  const html = htmlToText(message.getBody() || '');
+  if (plain.indexOf('position of') >= 0 || plain.length >= html.length) {
+    return (plain + '\n' + html).trim();
+  }
+  return (html + '\n' + plain).trim();
+}
+
+function htmlToText(html) {
+  return String(html || '')
+    .replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|tr|h1|h2|h3|li)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function parseMessage(fromHeader, subject, body, date) {
@@ -155,35 +218,48 @@ function inferStatus(blob) {
 }
 
 function inferCompany(fromHeader, subject, body) {
+  const blob = subject + '\n' + body;
+  const patterns = [
+    /thank you for applying to ([^.\n]+)/i,
+    /thank you for your interest in ([^.\n]+)/i,
+    /your application to ([^.\n]+)/i,
+    /application to ([^.\n]+)/i,
+  ];
+  for (let i = 0; i < patterns.length; i += 1) {
+    const match = blob.match(patterns[i]);
+    if (match) {
+      const company = cleanCompany(match[1]);
+      if (company) return company.slice(0, 120);
+    }
+  }
   const display = String(fromHeader || '').replace(/<.*?>/g, '').trim();
-  const cleaned = display
-    .replace(/(recruiting|careers|talent|university|noreply|no-reply)/gi, '')
+  return cleanCompany(display);
+}
+
+function cleanCompany(name) {
+  const text = String(name || '')
+    .replace(/(recruiting|careers|talent acquisition team|talent acquisition|university|noreply|no-reply|do not reply)/gi, '')
     .replace(/[-|]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if (cleaned && cleaned.length < 80 && cleaned.indexOf('@') === -1) {
-    const lowered = cleaned.toLowerCase();
-    if (['jobs', 'careers', 'recruiting', 'talent acquisition'].indexOf(lowered) === -1) {
-      return cleaned;
-    }
-  }
-  const patterns = [
-    /thank you for applying to ([^!.\n]+)/i,
-    /application (?:to|for) ([^!.\n]+)/i,
-    /your application to ([^!.\n]+)/i,
-  ];
-  const blob = subject + '\n' + body;
-  for (let i = 0; i < patterns.length; i += 1) {
-    const match = blob.match(patterns[i]);
-    if (match) return match[1].replace(/[*]/g, '').trim().slice(0, 120);
-  }
-  return '';
+  const junk = ['jobs', 'careers', 'recruiting', 'talent', 'no reply', 'noreply', ''];
+  if (!text || text.length > 80 || text.indexOf('@') >= 0 || junk.indexOf(text.toLowerCase()) >= 0) return '';
+  return text;
 }
 
 function inferTitle(subject, body) {
-  const blob = subject + '\n' + String(body || '').slice(0, 1500);
-  const match = blob.match(/(intern(?:ship)?|co-?op|new grad)[^\n.]{0,60}/i);
-  if (match) return match[0].replace(/\s+/g, ' ').trim().slice(0, 200);
+  const blob = subject + '\n' + String(body || '').slice(0, 4000);
+  const patterns = [
+    /(?:the\s+)?(?:position|role)\s+of\s+([^.\n]+)/i,
+    /application for(?: the)?(?: position of| role of)?\s+([^.\n]+)/i,
+    /for the\s+([^.\n]*?(?:intern(?:ship)?|co-?op|new grad)[^.\n]*)/i,
+  ];
+  for (let i = 0; i < patterns.length; i += 1) {
+    const match = blob.match(patterns[i]);
+    if (!match) continue;
+    let title = match[1].replace(/\s+/g, ' ').replace(/^(?:the|a|an)\s+/i, '').replace(/\s+role$/i, '').trim();
+    if (title.length >= 4) return title.slice(0, 200);
+  }
   return 'Internship';
 }
 
@@ -214,15 +290,24 @@ function applyHint(hint) {
   const matchRow = findCompanyRow(values, cols.company, hint.company);
   if (matchRow > 0) {
     const current = String(values[matchRow - 1][cols.result] || '');
-    if (!shouldAdvance(current, hint.result)) return 'skipped';
-    writeCell(sheet, matchRow, cols.result, hint.result);
+    const currentRole = cols.role >= 0 ? String(values[matchRow - 1][cols.role] || '') : '';
+    let changed = false;
+    if (shouldAdvance(current, hint.result)) {
+      writeCell(sheet, matchRow, cols.result, hint.result);
+      changed = true;
+    }
+    if (cols.role >= 0 && roleShouldReplace(currentRole, hint.role)) {
+      writeCell(sheet, matchRow, cols.role, hint.role);
+      changed = true;
+    }
     if (cols.notes >= 0 && hint.notes) {
       const existing = String(values[matchRow - 1][cols.notes] || '');
       if (existing.indexOf(hint.notes) === -1) {
         writeCell(sheet, matchRow, cols.notes, (hint.notes + (existing ? '\n' + existing : '')).trim());
+        changed = true;
       }
     }
-    return 'updated';
+    return changed ? 'updated' : 'skipped';
   }
   const emptyRow = firstEmptyCompanyRow(values, cols.company);
   writeCell(sheet, emptyRow, cols.date, hint.dateApplied);
@@ -283,6 +368,14 @@ function shouldAdvance(current, next) {
   if (nextRank > currentRank) return true;
   if (next === 'Rejected' && current !== 'Offer') return true;
   return false;
+}
+
+function roleShouldReplace(current, next) {
+  const now = String(current || '').trim().toLowerCase();
+  const nxt = String(next || '').trim();
+  if (!nxt) return false;
+  if ((now === '' || now === 'intern' || now === 'internship' || now === 'role') && nxt.toLowerCase() !== 'intern') return true;
+  return nxt.length > String(current || '').length + 6;
 }
 
 function writeCell(sheet, row, colIndex, value) {

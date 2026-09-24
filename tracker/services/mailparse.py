@@ -115,39 +115,75 @@ def infer_status(text: str) -> tuple[str | None, float]:
     return None, 0.0
 
 
+JUNK_COMPANY = {
+    "jobs",
+    "careers",
+    "recruiting",
+    "talent",
+    "talent acquisition",
+    "talent acquisition team",
+    "no reply",
+    "noreply",
+    "no-reply",
+    "do not reply",
+    "notifications",
+    "mailer daemon",
+}
+
+
+def _clean_company(name: str) -> str:
+    text = re.sub(r"(recruiting|careers|talent acquisition team|talent acquisition|university|noreply|no-reply|do not reply)", "", name or "", flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" -|*,")
+    if not text or text.lower() in JUNK_COMPANY or "@" in text or len(text) > 80:
+        return ""
+    return text
+
+
 def infer_company(from_header: str, subject: str, body: str) -> str:
-    display, _addr = parseaddr(from_header or "")
-    from_name = re.sub(r"(recruiting|careers|talent|university|noreply|no-reply)", "", display, flags=re.I).strip(" -|")
-    if from_name and len(from_name) < 80 and "@" not in from_name:
-        lowered = from_name.lower()
-        if lowered not in {"jobs", "careers", "recruiting", "talent acquisition"}:
-            return re.sub(r"\s+", " ", from_name)
-    domain_company = _company_from_domain(from_header)
-    if domain_company:
-        return domain_company
-    patterns = [
-        r"thank you for applying to ([^!.\n]+)",
-        r"application (?:to|for) ([^!.\n]+)",
-        r"your application to ([^!.\n]+)",
-        r"interview with ([^!.\n]+)",
-    ]
     blob = f"{subject}\n{body}"
+    patterns = [
+        r"thank you for applying to ([^.\n]+)",
+        r"thank you for your interest in ([^.\n]+)",
+        r"your application to ([^.\n]+)",
+        r"application to ([^.\n]+)",
+        r"interview with ([^.\n]+)",
+    ]
     for pattern in patterns:
         match = re.search(pattern, blob, flags=re.I)
         if match:
-            return match.group(1).strip(" *")[:120]
-    return ""
+            company = _clean_company(match.group(1))
+            if company:
+                return company[:120]
+    display, _addr = parseaddr(from_header or "")
+    from_name = _clean_company(display)
+    if from_name:
+        return from_name
+    return _company_from_domain(from_header)
+
+
+def _clean_title(title: str) -> str:
+    text = re.sub(r"\s+", " ", title or "").strip(" -:*,")
+    text = re.sub(r"^(?:the|a|an)\s+", "", text, flags=re.I)
+    text = re.sub(r"\s+role$", "", text, flags=re.I)
+    text = re.sub(r"^(?:position|role)\s+of\s+", "", text, flags=re.I)
+    return text.strip()[:200]
 
 
 def infer_title(subject: str, body: str) -> str:
-    blob = f"{subject}\n{body[:1500]}"
-    match = re.search(
-        r"(intern(?:ship)?|co-?op|new grad)[^.\n]{0,60}",
-        blob,
-        flags=re.I,
-    )
-    if match:
-        return re.sub(r"\s+", " ", match.group(0)).strip()[:200]
+    blob = f"{subject}\n{body[:4000]}"
+    patterns = [
+        r"(?:the\s+)?(?:position|role)\s+of\s+([^.\n]+)",
+        r"application for(?: the)?(?: position of| role of)?\s+([^.\n]+)",
+        r"for the\s+([^.\n]*?(?:intern(?:ship)?|co-?op|new grad)[^.\n]*)",
+        r"((?:software|firmware|hardware|data|machine learning|electrical|mechanical|product|research)[^.\n]{0,60}(?:intern(?:ship)?|co-?op|new grad))",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, blob, flags=re.I)
+        if not match:
+            continue
+        title = _clean_title(match.group(1))
+        if len(title) >= 4 and title.lower() not in {"the", "this", "your application"}:
+            return title
     return "Internship"
 
 
@@ -194,7 +230,25 @@ def _norm_company(name: str) -> str:
     return text
 
 
-def _match_opportunity(user, company: str) -> Opportunity | None:
+PARSER_VERSION = 3
+
+
+def _title_tokens(title: str) -> set[str]:
+    stop = {"the", "a", "an", "of", "and", "for", "role", "position"}
+    return {part for part in normalize_skill(title).split() if part and part not in stop}
+
+
+def _titles_match(left: str, right: str) -> bool:
+    a = normalize_skill(left)
+    b = normalize_skill(right)
+    if not a or not b:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    return len(_title_tokens(left) & _title_tokens(right)) >= 2
+
+
+def _match_opportunity(user, company: str, title: str = "") -> Opportunity | None:
     target = _norm_company(company)
     if len(target) < 2:
         return None
@@ -203,7 +257,25 @@ def _match_opportunity(user, company: str) -> Opportunity | None:
         for opp in Opportunity.objects.filter(user=user, is_archived=False)
         if _norm_company(opp.company) == target
     ]
-    return matches[0] if len(matches) == 1 else None
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    titled = [opp for opp in matches if _titles_match(opp.title, title)]
+    if len(titled) == 1:
+        return titled[0]
+    return None
+
+
+def _title_is_better(current: str, hinted: str) -> bool:
+    now = (current or "").strip()
+    nxt = (hinted or "").strip()
+    if not nxt:
+        return False
+    generic = {"intern", "internship", "role", "position"}
+    if now.lower() in generic and nxt.lower() not in generic:
+        return True
+    return len(nxt) > len(now) + 6 and "intern" in nxt.lower()
 
 
 def apply_mail_hints(user, hints: list[MailHint]) -> dict:
@@ -211,13 +283,21 @@ def apply_mail_hints(user, hints: list[MailHint]) -> dict:
     updated = 0
     skipped = 0
     for hint in hints:
-        existing = _match_opportunity(user, hint.company)
+        existing = _match_opportunity(user, hint.company, hint.title)
         if existing:
+            fields_changed = False
+            if _title_is_better(existing.title, hint.title):
+                existing.title = hint.title
+                existing.save(update_fields=["title", "updated_at"])
+                fields_changed = True
             current = SHEET_STATUS_FROM_FULL.get(existing.status, existing.status)
             current_rank = SHEET_STATUS_RANK.get(current, 0)
             next_rank = SHEET_STATUS_RANK.get(hint.status, 0)
             if current == OpportunityStatus.OFFER and hint.status == OpportunityStatus.REJECTED:
-                skipped += 1
+                if fields_changed:
+                    updated += 1
+                else:
+                    skipped += 1
                 continue
             offer_beats_reject = (
                 hint.status == OpportunityStatus.OFFER and current == OpportunityStatus.REJECTED
@@ -227,6 +307,8 @@ def apply_mail_hints(user, hints: list[MailHint]) -> dict:
                 if hint.note and hint.note not in (existing.notes or ""):
                     existing.notes = f"{hint.note}\n{existing.notes}".strip()
                     existing.save(update_fields=["notes", "updated_at"])
+                updated += 1
+            elif fields_changed:
                 updated += 1
             else:
                 skipped += 1

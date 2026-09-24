@@ -30,8 +30,10 @@
     <p>Gmail connected{% if account.last_synced_at %} · last sync {{ account.last_synced_at }}{% endif %}</p>
     <p class="row">
       <a class="btn" href="{% url 'gmail_sync' %}">Sync now</a>
+      <a class="btn secondary" href="{% url 'gmail_recheck' %}">Recheck scraped mail</a>
       <form method="post" action="{% url 'gmail_disconnect' %}">{% csrf_token %}<button class="btn ghost" type="submit">Disconnect</button></form>
     </p>
+    <p class="muted">Do not delete everything. Recheck re-opens emails already scraped and corrects company, role, and status. About 30 per click because of Gmail limits. Junk leftover rows like “No Reply” you can delete by hand.</p>
   {% elif gmail_ready %}
     <form method="post">{% csrf_token %}<button class="btn" type="submit" name="oauth" value="1">Connect Gmail</button></form>
     <p class="muted">Asks for Gmail read-only and permission to update the spreadsheet.</p>
