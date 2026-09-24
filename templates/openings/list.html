@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Openings{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Openings</h1>
+  <a class="btn secondary" href="{% url 'openings' %}?refresh=1">Refresh</a>
+</div>
+<p class="lede">Public SimplifyJobs intern list. Tap a posting, apply, then I applied.</p>
+{% if created %}
+  {% if last_viewed %}
+    <p>{{ created }} newly listed roles were added.</p>
+  {% else %}
+    <p>Loaded {{ created }} roles from GitHub.</p>
+  {% endif %}
+{% endif %}
+{% if error %}<p class="muted">{{ error }}</p>{% endif %}
+
+<form method="get" class="toolbar">
+  <input class="input" name="q" value="{{ q }}" placeholder="Search">
+  <select class="input select" name="category">
+    <option value="">All</option>
+    {% for item in categories %}
+      <option value="{{ item }}" {% if category == item %}selected{% endif %}>{{ item }}</option>
+    {% endfor %}
+  </select>
+  <label class="check"><input type="checkbox" name="new" value="1" {% if request.GET.new == "1" %}checked{% endif %}> New</label>
+  <button class="btn ghost" type="submit">Filter</button>
+</form>
+
+<div class="card-list">
+  {% for listing in listings %}
+    <article class="job-card">
+      <div class="row space">
+        <strong>{{ listing.company }}</strong>
+        <span class="muted">{{ listing.age_label }}</span>
+      </div>
+      <p>{{ listing.title }}</p>
+      <p class="muted">{{ listing.location }} · {{ listing.category }}</p>
+      {% if last_viewed and listing.first_seen_at > last_viewed %}<span class="badge overdue">New</span>
+      {% elif not last_viewed and listing.age_days is not None and listing.age_days <= 1 %}<span class="badge overdue">New</span>{% endif %}
+      <div class="row">
+        {% if listing.apply_url %}<a class="btn" href="{{ listing.apply_url }}" target="_blank" rel="noopener">Apply</a>{% endif %}
+        {% if listing.listing_key in saved_keys %}
+          <span class="muted">On sheet</span>
+        {% else %}
+          <form method="post" action="{% url 'opening_save' listing.pk %}">{% csrf_token %}<input type="hidden" name="next" value="{% url 'openings' %}"><button class="btn ghost" type="submit">Save</button></form>
+          <form method="post" action="{% url 'opening_save' listing.pk %}">{% csrf_token %}<input type="hidden" name="applied" value="1"><input type="hidden" name="next" value="{% url 'home' %}"><button class="btn secondary" type="submit">I applied</button></form>
+        {% endif %}
+      </div>
+    </article>
+  {% empty %}
+    <div class="empty">Refresh to load openings (needs internet).</div>
+  {% endfor %}
+</div>
+{% endblock %}

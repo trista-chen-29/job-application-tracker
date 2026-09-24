@@ -3,15 +3,19 @@ from django.urls import path
 from tracker import views
 
 urlpatterns = [
-    path("", views.DashboardView.as_view(), name="dashboard"),
+    path("", views.GmailConnectView.as_view(), name="home"),
     path("register/", views.RegisterView.as_view(), name="register"),
     path("account/", views.AccountView.as_view(), name="account"),
+    path("dashboard/", views.DashboardView.as_view(), name="dashboard"),
+    path("openings/", views.OpeningsView.as_view(), name="openings"),
+    path("openings/<int:pk>/save/", views.OpeningSaveView.as_view(), name="opening_save"),
     path("opportunities/", views.OpportunityListView.as_view(), name="opportunity_list"),
     path("opportunities/board/", views.OpportunityBoardView.as_view(), name="opportunity_board"),
     path("opportunities/new/", views.OpportunityCreateView.as_view(), name="opportunity_create"),
     path("opportunities/<int:pk>/", views.OpportunityDetailView.as_view(), name="opportunity_detail"),
     path("opportunities/<int:pk>/edit/", views.OpportunityUpdateView.as_view(), name="opportunity_edit"),
     path("opportunities/<int:pk>/status/", views.StatusChangeView.as_view(), name="opportunity_status"),
+    path("opportunities/<int:pk>/notes/", views.SheetNotesView.as_view(), name="opportunity_notes"),
     path("opportunities/<int:pk>/archive/", views.OpportunityArchiveView.as_view(), name="opportunity_archive"),
     path("opportunities/<int:pk>/duplicate/", views.OpportunityDuplicateView.as_view(), name="opportunity_duplicate"),
     path("opportunities/<int:pk>/delete/", views.OpportunityDeleteView.as_view(), name="opportunity_delete"),
@@ -41,6 +45,10 @@ urlpatterns = [
     path("templates/", views.TemplateCreateView.as_view(), name="template_create"),
     path("templates/<int:pk>/delete/", views.TemplateDeleteView.as_view(), name="template_delete"),
     path("analytics/", views.AnalyticsView.as_view(), name="analytics"),
+    path("gmail/", views.GmailConnectView.as_view(), name="gmail_connect"),
+    path("gmail/callback/", views.GmailCallbackView.as_view(), name="gmail_callback"),
+    path("gmail/sync/", views.GmailSyncView.as_view(), name="gmail_sync"),
+    path("gmail/disconnect/", views.GmailDisconnectView.as_view(), name="gmail_disconnect"),
     path("import-export/", views.ImportExportView.as_view(), name="import_export"),
     path("export/<str:kind>/", views.ExportDownloadView.as_view(), name="export_download"),
 ]

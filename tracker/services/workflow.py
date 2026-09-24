@@ -89,6 +89,7 @@ def duplicate_opportunity(opportunity: Opportunity) -> Opportunity:
     clone.is_archived = False
     clone.match_payload = {}
     clone.match_score = None
+    clone.simplify_key = ""
     clone.save()
     for skill in skills:
         clone.skills.create(name=skill.name, normalized_name=skill.normalized_name, kind=skill.kind)

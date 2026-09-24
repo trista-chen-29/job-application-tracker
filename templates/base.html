@@ -3,27 +3,20 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>{% block title %}Job tracker{% endblock %}</title>
   <link rel="stylesheet" href="{% static 'css/app.css' %}">
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
 </head>
 <body hx-headers='{"X-CSRFToken": "{{ csrf_token }}"}'>
   <header class="topbar">
-    <a class="brand" href="{% url 'dashboard' %}">Application desk</a>
+    <a class="brand" href="{% url 'home' %}">Gmail Sheet</a>
     {% if user.is_authenticated %}
-      <nav class="nav">
-        <a href="{% url 'dashboard' %}">Dashboard</a>
-        <a href="{% url 'opportunity_list' %}">Opportunities {% if nav_active %}<span class="badge">{{ nav_active }}</span>{% endif %}</a>
-        <a href="{% url 'opportunity_board' %}">Pipeline</a>
-        <a href="{% url 'tasks' %}">Tasks {% if nav_overdue %}<span class="badge overdue">{{ nav_overdue }} overdue</span>{% endif %}</a>
-        <a href="{% url 'contacts' %}">Contacts</a>
-        <a href="{% url 'materials' %}">Materials</a>
-        <a href="{% url 'profile' %}">Profile</a>
-        <a href="{% url 'analytics' %}">Analytics</a>
-        <a href="{% url 'import_export' %}">Import/Export</a>
-        <a href="{% url 'account' %}">{{ user.username }}</a>
-        <form method="post" action="{% url 'logout' %}" style="display:inline">{% csrf_token %}<button class="btn ghost" type="submit">Log out</button></form>
+      <nav class="nav desktop-nav">
+        <a href="{% url 'home' %}">Gmail</a>
+        <a href="{% url 'opportunity_list' %}">Local copy</a>
+        <a href="{% url 'account' %}">Account</a>
+        <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="btn ghost" type="submit">Log out</button></form>
       </nav>
     {% endif %}
   </header>
@@ -35,5 +28,12 @@
     {% endif %}
     {% block content %}{% endblock %}
   </main>
+  {% if user.is_authenticated %}
+  <nav class="bottom-nav">
+    <a href="{% url 'home' %}">Gmail</a>
+    <a href="{% url 'opportunity_list' %}">Local</a>
+    <a href="{% url 'account' %}">More</a>
+  </nav>
+  {% endif %}
 </body>
 </html>

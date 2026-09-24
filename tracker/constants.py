@@ -31,6 +31,42 @@ ACTIVE_STATUSES = {
     OpportunityStatus.OFFER,
 }
 
+SHEET_STATUSES = (
+    (OpportunityStatus.SAVED, "Saved"),
+    (OpportunityStatus.APPLIED, "Applied"),
+    (OpportunityStatus.ONLINE_ASSESSMENT, "OA"),
+    (OpportunityStatus.INTERVIEWING, "Interview"),
+    (OpportunityStatus.OFFER, "Offer"),
+    (OpportunityStatus.REJECTED, "Rejected"),
+)
+
+SHEET_STATUS_VALUES = {value for value, _label in SHEET_STATUSES}
+
+SHEET_STATUS_FROM_FULL = {
+    OpportunityStatus.SAVED: OpportunityStatus.SAVED,
+    OpportunityStatus.RESEARCHING: OpportunityStatus.SAVED,
+    OpportunityStatus.PREPARING: OpportunityStatus.SAVED,
+    OpportunityStatus.APPLIED: OpportunityStatus.APPLIED,
+    OpportunityStatus.RECRUITER_CONTACTED: OpportunityStatus.APPLIED,
+    OpportunityStatus.RECRUITER_SCREEN: OpportunityStatus.INTERVIEWING,
+    OpportunityStatus.ONLINE_ASSESSMENT: OpportunityStatus.ONLINE_ASSESSMENT,
+    OpportunityStatus.INTERVIEWING: OpportunityStatus.INTERVIEWING,
+    OpportunityStatus.OFFER: OpportunityStatus.OFFER,
+    OpportunityStatus.ACCEPTED: OpportunityStatus.OFFER,
+    OpportunityStatus.REJECTED: OpportunityStatus.REJECTED,
+    OpportunityStatus.WITHDRAWN: OpportunityStatus.REJECTED,
+    OpportunityStatus.CLOSED: OpportunityStatus.REJECTED,
+}
+
+SHEET_STATUS_RANK = {
+    OpportunityStatus.SAVED: 0,
+    OpportunityStatus.APPLIED: 1,
+    OpportunityStatus.ONLINE_ASSESSMENT: 2,
+    OpportunityStatus.INTERVIEWING: 3,
+    OpportunityStatus.OFFER: 4,
+    OpportunityStatus.REJECTED: 4,
+}
+
 TERMINAL_STATUSES = {
     OpportunityStatus.ACCEPTED,
     OpportunityStatus.REJECTED,
@@ -92,6 +128,7 @@ class Source(models.TextChoices):
     RECRUITER = "recruiter", "Recruiter"
     PROFESSOR = "professor", "Professor"
     ALUMNI = "alumni", "Alumni"
+    SIMPLIFY = "simplify", "SimplifyJobs list"
     OTHER = "other", "Other"
 
 

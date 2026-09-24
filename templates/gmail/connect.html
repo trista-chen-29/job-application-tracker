@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Gmail → Sheet{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Gmail → Google Sheet</h1>
+</div>
+<p class="lede">Pull recruiter confirmation mail and fill your existing tracker (internships / newgrad). Status keeps moving as OA, interview, offer, and rejection emails arrive.</p>
+
+<div class="card">
+  <h2>Recommended: sheet plugin</h2>
+  <p>This lives on your spreadsheet, like an add-on. No extra website to keep running.</p>
+  <ol class="steps">
+    <li>Open <a href="https://docs.google.com/spreadsheets/d/1fm93wHklieth-pt8Uk2xDwzKkDGVGEc9JiR_3mrOh2o/edit" target="_blank" rel="noreferrer">Trista Internship Tracker</a>.</li>
+    <li>Extensions → Apps Script. Replace the default file with <code>sheets-addon/Code.gs</code> and add <code>appsscript.json</code> from this repo.</li>
+    <li>Save, go back to the sheet, reload. Use <strong>Tracker → Sync Gmail now</strong>, then <strong>Install hourly sync</strong>.</li>
+    <li>Approve Gmail + Sheets when Google asks. Use the same Google account as this inbox.</li>
+  </ol>
+  <p class="muted">It fills the first empty Company row (so your dropdown templates stay put) and will not overwrite Offer with Rejected.</p>
+</div>
+
+<div class="card" style="margin-top:1rem">
+  <h2>Or sync from this app</h2>
+  <form method="post" class="stack">
+    {% csrf_token %}
+    <label class="muted" for="spreadsheet_url">Google Sheet link</label>
+    <input class="input" id="spreadsheet_url" name="spreadsheet_url" value="{{ spreadsheet_url }}" placeholder="https://docs.google.com/spreadsheets/d/…/edit">
+    <button class="btn secondary" type="submit" name="save_sheet" value="1">Save sheet</button>
+  </form>
+  {% if account %}
+    <p>Gmail connected{% if account.last_synced_at %} · last sync {{ account.last_synced_at }}{% endif %}</p>
+    <p class="row">
+      <a class="btn" href="{% url 'gmail_sync' %}">Sync now</a>
+      <form method="post" action="{% url 'gmail_disconnect' %}">{% csrf_token %}<button class="btn ghost" type="submit">Disconnect</button></form>
+    </p>
+  {% elif gmail_ready %}
+    <form method="post">{% csrf_token %}<button class="btn" type="submit" name="oauth" value="1">Connect Gmail</button></form>
+    <p class="muted">Asks for Gmail read-only and permission to update the spreadsheet.</p>
+  {% else %}
+    <p class="muted">Add <code>GOOGLE_OAUTH_CLIENT_ID</code> and <code>GOOGLE_OAUTH_CLIENT_SECRET</code> to <code>.env</code> if you want the web app to push rows. The sheet plugin above does not need that.</p>
+  {% endif %}
+</div>
+
+<details class="panel" style="margin-top:1rem">
+  <summary>Paste recruiter emails instead</summary>
+  <form method="post">
+    {% csrf_token %}
+    <textarea class="input textarea" name="pasted" rows="10" placeholder="From: Stripe Recruiting &lt;university@stripe.com&gt;
+Subject: Thank you for applying to Stripe
+
+We have received your application for the Software Engineer Intern role..."></textarea>
+    <button class="btn" type="submit">Fill from paste</button>
+  </form>
+</details>
+{% endblock %}

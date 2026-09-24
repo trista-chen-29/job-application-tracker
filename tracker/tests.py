@@ -169,3 +169,261 @@ class WorkflowPageTests(TestCase):
         brief = self.client.get(reverse("opportunity_brief", args=[opp.pk]))
         self.assertEqual(brief.status_code, 200)
         self.assertIn(b"Acme", brief.content)
+
+
+SAMPLE_README = """
+<h2>Software Engineering Internship Roles</h2>
+<table>
+<thead><tr><th>Company</th><th>Role</th><th>Location</th><th>Application</th><th>Age</th></tr></thead>
+<tbody>
+<tr>
+<td><strong><a href="https://simplify.jobs/c/Acme">Acme</a></strong></td>
+<td>Software Engineer Intern</td>
+<td>Austin, TX</td>
+<td><a href="https://boards.greenhouse.io/acme/jobs/123?utm_source=Simplify">Apply</a></td>
+<td>0d</td>
+</tr>
+<tr>
+<td>↳</td>
+<td>Firmware Intern</td>
+<td>Remote</td>
+<td><a href="https://boards.greenhouse.io/acme/jobs/124">Apply</a></td>
+<td>1d</td>
+</tr>
+</tbody>
+</table>
+"""
+
+
+class SheetTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("sheet", "sheet@example.com", "pass12345")
+        self.client.force_login(self.user)
+
+    def test_home_is_gmail_to_sheet(self):
+        response = self.client.get(reverse("home"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Gmail")
+        self.assertContains(response, "Google Sheet")
+
+    def test_quick_add_and_inline_status(self):
+        add = self.client.post(reverse("opportunity_list"), {"company": "Globex", "title": "Intern", "url": "https://example.com/job", "status": "applied"})
+        self.assertEqual(add.status_code, 302)
+        opp = Opportunity.objects.get(user=self.user)
+        self.assertEqual(opp.status, OpportunityStatus.APPLIED)
+        changed = self.client.post(reverse("opportunity_status", args=[opp.pk]), {"status": "interviewing"})
+        self.assertEqual(changed.status_code, 302)
+        opp.refresh_from_db()
+        self.assertEqual(opp.status, OpportunityStatus.INTERVIEWING)
+
+
+class SimplifyFeedTests(TestCase):
+    def test_parser_reads_company_role_and_nested_rows(self):
+        from tracker.services.simplify import parse_listings, sync_listings
+
+        rows = parse_listings(SAMPLE_README)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].company, "Acme")
+        self.assertEqual(rows[0].title, "Software Engineer Intern")
+        self.assertIn("greenhouse.io", rows[0].apply_url)
+        self.assertEqual(rows[1].company, "Acme")
+        self.assertEqual(rows[1].title, "Firmware Intern")
+        result = sync_listings(SAMPLE_README)
+        self.assertEqual(result["created"], 2)
+
+    def test_save_opening_to_sheet(self):
+        from tracker.services.simplify import sync_listings
+        from tracker.models import SimplifyListing
+
+        sync_listings(SAMPLE_README)
+        listing = SimplifyListing.objects.get(title="Software Engineer Intern")
+        self.client.force_login(User.objects.create_user("feed", "feed@example.com", "pass12345"))
+        response = self.client.post(reverse("opening_save", args=[listing.pk]), {"applied": "1"})
+        self.assertEqual(response.status_code, 302)
+        opp = Opportunity.objects.get(simplify_key=listing.listing_key)
+        self.assertEqual(opp.company, "Acme")
+        self.assertEqual(opp.status, OpportunityStatus.APPLIED)
+
+
+class MailParseTests(TestCase):
+    def test_applied_email_creates_row(self):
+        from tracker.services.mailparse import apply_mail_hints, parse_pasted_emails
+
+        user = User.objects.create_user("mail", "mail@example.com", "pass12345")
+        raw = (
+            "From: Stripe Recruiting <university@stripe.com>\n"
+            "Subject: Thank you for applying to Stripe\n\n"
+            "We have received your application for the Software Engineer Intern role.\n"
+        )
+        hints = parse_pasted_emails(raw)
+        self.assertEqual(len(hints), 1)
+        self.assertEqual(hints[0].status, OpportunityStatus.APPLIED)
+        result = apply_mail_hints(user, hints)
+        self.assertEqual(result["created"], 1)
+        opp = Opportunity.objects.get(user=user)
+        self.assertEqual(opp.company, "Stripe")
+        self.assertEqual(opp.status, OpportunityStatus.APPLIED)
+
+    def test_later_email_updates_existing_row(self):
+        from tracker.services.mailparse import apply_mail_hints, parse_message
+
+        user = User.objects.create_user("mail2", "mail2@example.com", "pass12345")
+        Opportunity.objects.create(user=user, company="Northwind", title="Intern", status=OpportunityStatus.APPLIED)
+        hint = parse_message(
+            "Northwind University <campus@northwind.com>",
+            "Online assessment invitation",
+            "Please complete the HackerRank online assessment this week.",
+        )
+        self.assertIsNotNone(hint)
+        result = apply_mail_hints(user, [hint])
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(Opportunity.objects.get(user=user).status, OpportunityStatus.ONLINE_ASSESSMENT)
+
+    def test_confirmation_with_interview_word_stays_applied(self):
+        from tracker.services.mailparse import parse_message
+
+        hint = parse_message(
+            "Acme Recruiting <jobs@acme.com>",
+            "Thank you for applying to Acme",
+            "We received your application. Next steps in our interview process will follow.",
+        )
+        self.assertIsNotNone(hint)
+        self.assertEqual(hint.status, OpportunityStatus.APPLIED)
+
+    def test_short_company_name_does_not_attach_to_unrelated_row(self):
+        from tracker.services.mailparse import apply_mail_hints, parse_message
+
+        user = User.objects.create_user("mail3", "mail3@example.com", "pass12345")
+        Opportunity.objects.create(user=user, company="Google", title="SWE Intern", status=OpportunityStatus.SAVED)
+        hint = parse_message(
+            "Go Team <campus@go.com>",
+            "Thank you for applying to Go",
+            "We have received your application for the intern role.",
+        )
+        self.assertIsNotNone(hint)
+        result = apply_mail_hints(user, [hint])
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(Opportunity.objects.filter(user=user).count(), 2)
+        self.assertEqual(Opportunity.objects.get(user=user, company="Google").status, OpportunityStatus.SAVED)
+
+    def test_rejection_does_not_overwrite_offer(self):
+        from tracker.services.mailparse import apply_mail_hints, parse_message
+
+        user = User.objects.create_user("mail4", "mail4@example.com", "pass12345")
+        Opportunity.objects.create(user=user, company="Harbor", title="Intern", status=OpportunityStatus.OFFER)
+        hint = parse_message(
+            "Harbor Recruiting <jobs@harbor.com>",
+            "Update",
+            "Unfortunately we are not moving forward.",
+        )
+        result = apply_mail_hints(user, [hint])
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(Opportunity.objects.get(user=user).status, OpportunityStatus.OFFER)
+
+    def test_offer_email_can_replace_rejection(self):
+        from tracker.services.mailparse import apply_mail_hints, parse_message
+
+        user = User.objects.create_user("mail6", "mail6@example.com", "pass12345")
+        Opportunity.objects.create(user=user, company="Harbor", title="Intern", status=OpportunityStatus.REJECTED)
+        hint = parse_message(
+            "Harbor Recruiting <jobs@harbor.com>",
+            "Offer of employment",
+            "We are pleased to offer you an intern role.",
+        )
+        result = apply_mail_hints(user, [hint])
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(Opportunity.objects.get(user=user).status, OpportunityStatus.OFFER)
+
+    def test_duplicate_clears_simplify_key(self):
+        from tracker.services.workflow import duplicate_opportunity
+
+        user = User.objects.create_user("dupkey", "dupkey@example.com", "pass12345")
+        opp = Opportunity.objects.create(
+            user=user,
+            company="Acme",
+            title="Intern",
+            simplify_key="abc123",
+            status=OpportunityStatus.APPLIED,
+        )
+        clone = duplicate_opportunity(opp)
+        self.assertEqual(clone.simplify_key, "")
+        opp.refresh_from_db()
+        self.assertEqual(opp.simplify_key, "abc123")
+
+    def test_gmail_paste_fills_sheet(self):
+        user = User.objects.create_user("mail5", "mail5@example.com", "pass12345")
+        self.client.force_login(user)
+        raw = (
+            "From: Persona AI <university@persona.ai>\n"
+            "Subject: Thank you for applying to Persona AI\n\n"
+            "We have received your application for the intern role.\n"
+        )
+        response = self.client.post(reverse("gmail_connect"), {"pasted": raw})
+        self.assertEqual(response.status_code, 302)
+        opp = Opportunity.objects.get(user=user)
+        self.assertEqual(opp.status, OpportunityStatus.APPLIED)
+
+
+class GoogleSheetFillTests(TestCase):
+    def test_spreadsheet_id_from_share_link(self):
+        from tracker.services.gsheet import spreadsheet_id_from_url
+
+        url = "https://docs.google.com/spreadsheets/d/1fm93wHklieth-pt8Uk2xDwzKkDGVGEc9JiR_3mrOh2o/edit?gid=0#gid=0"
+        self.assertEqual(spreadsheet_id_from_url(url), "1fm93wHklieth-pt8Uk2xDwzKkDGVGEc9JiR_3mrOh2o")
+
+    def test_intern_confirmation_fills_first_empty_internships_row(self):
+        from tracker.constants import OpportunityStatus
+        from tracker.services.gsheet import hint_from_mail, upsert_plan
+
+        rows = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["", "", "", "", "Summer 2027", "Applied", ""],
+            ["", "", "", "", "Summer 2027", "Applied", ""],
+        ]
+        hint = hint_from_mail(
+            "Stripe",
+            "Software Engineer Intern",
+            OpportunityStatus.APPLIED,
+            "From email: Thank you for applying to Stripe",
+            "We have received your application. Location: New York, NY",
+            "2026-09-24",
+        )
+        self.assertEqual(hint.tab, "internships")
+        self.assertEqual(hint.result, "Applied")
+        self.assertEqual(hint.location, "New York, NY")
+        plan = upsert_plan(rows, hint)
+        self.assertEqual(plan["action"], "create")
+        self.assertEqual(plan["row"], 2)
+
+    def test_new_grad_goes_to_newgrad_tab(self):
+        from tracker.constants import OpportunityStatus
+        from tracker.services.gsheet import hint_from_mail
+
+        hint = hint_from_mail(
+            "Acme",
+            "Software Engineer New Grad",
+            OpportunityStatus.APPLIED,
+            "note",
+            "Thanks for applying to our new grad program.",
+        )
+        self.assertEqual(hint.tab, "newgrad")
+
+    def test_rejection_does_not_replace_offer_on_sheet(self):
+        from tracker.services.gsheet import SheetHint, upsert_plan
+
+        rows = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["2026-09-01", "Harbor", "Intern", "", "Summer 2027", "Offer", ""],
+        ]
+        hint = SheetHint(
+            company="Harbor",
+            role="Intern",
+            location="",
+            tab="internships",
+            result="Rejected",
+            notes="Unfortunately",
+            date_applied="2026-09-24",
+        )
+        plan = upsert_plan(rows, hint)
+        self.assertEqual(plan["action"], "skipped")
+

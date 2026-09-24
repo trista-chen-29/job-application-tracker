@@ -1,48 +1,66 @@
 {% extends "base.html" %}
-{% block title %}Opportunities{% endblock %}
+{% load sheet_tags %}
+{% block title %}Applications{% endblock %}
 {% block content %}
-<div class="row space">
-  <div>
-    <h1>Opportunities</h1>
-    <p class="lede">Filter the pipeline without leaving this table.</p>
-  </div>
-  <div class="row">
-    <a class="btn secondary" href="{% url 'opportunity_board' %}">Board view</a>
-    <a class="btn" href="{% url 'opportunity_create' %}">Add a role</a>
+<div class="page-head">
+  <h1>Applications</h1>
+  <div class="row actions">
+    {% if gmail_account %}
+      <a class="btn" href="{% url 'gmail_sync' %}">Sync Gmail</a>
+    {% else %}
+      <a class="btn" href="{% url 'gmail_connect' %}">Connect Gmail</a>
+    {% endif %}
+  <a class="btn secondary" href="{% url 'home' %}">Gmail sync</a>
   </div>
 </div>
-<form class="card" method="get" style="margin-bottom:1rem">
-  <div class="form-grid">
-    <div class="span-2">{{ form.q }}</div>
-    <div>{{ form.status }}</div>
-    <div>{{ form.match_category }}</div>
-    <div>{{ form.priority }}</div>
-    <div>{{ form.source }}</div>
-    <div>{{ form.work_arrangement }}</div>
-    <div>{{ form.sponsorship_status }}</div>
-    <div>{{ form.track }}</div>
-  </div>
-  <p class="row"><button class="btn" type="submit">Filter</button><a class="btn ghost" href="{% url 'opportunity_list' %}">Reset</a></p>
+<p class="lede">Optional local copy. The live tracker is the Google Sheet filled from Gmail.</p>
+
+<form method="get" class="toolbar">
+  <input class="input" name="q" value="{{ q }}" placeholder="Search">
+  <select class="input select" name="status" onchange="this.form.submit()">
+    <option value="">All</option>
+    {% for value, label in sheet_statuses %}
+      <option value="{{ value }}" {% if status == value %}selected{% endif %}>{{ label }}</option>
+    {% endfor %}
+  </select>
 </form>
+
 {% if opportunities %}
-<table>
+<div class="sheet-wrap">
+<table class="sheet">
   <thead>
-    <tr><th>Role</th><th>Status</th><th>Match</th><th>Priority</th><th>Deadline</th><th>Source</th></tr>
+    <tr>
+      <th>Company</th>
+      <th>Role</th>
+      <th>Status</th>
+      <th>Applied</th>
+      <th>Notes</th>
+    </tr>
   </thead>
   <tbody>
     {% for opp in opportunities %}
-      <tr>
-        <td><a href="{% url 'opportunity_detail' opp.pk %}">{{ opp.title }}</a><br><span class="muted">{{ opp.company }} · {{ opp.location }}</span></td>
-        <td>{{ opp.get_status_display }}</td>
-        <td><span class="badge {{ opp.match_category }}">{{ opp.get_match_category_display }}</span></td>
-        <td><span class="badge {{ opp.priority }}">{{ opp.get_priority_display }}</span></td>
-        <td>{{ opp.deadline|default:"—" }}</td>
-        <td>{{ opp.get_source_display }}</td>
-      </tr>
+      {% include "opportunities/_sheet_row.html" %}
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% else %}
-  <div class="empty">No opportunities match those filters. Add one from a career page by pasting the description — you only need title, company, URL, and text to start.</div>
+  <div class="empty">Nothing on the sheet yet. Connect Gmail to pull recruiter mail, or save a role from Openings.</div>
 {% endif %}
+
+<details class="panel quiet">
+  <summary>Add a row manually</summary>
+  <form method="post" class="sheet-add">
+    {% csrf_token %}
+    <input class="input" name="company" placeholder="Company" required>
+    <input class="input" name="title" placeholder="Role" required>
+    <input class="input" name="url" placeholder="Job URL (optional)">
+    <select class="input select" name="status">
+      {% for value, label in sheet_statuses %}
+        <option value="{{ value }}" {% if value == "applied" %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <button class="btn" type="submit">Add</button>
+  </form>
+</details>
 {% endblock %}

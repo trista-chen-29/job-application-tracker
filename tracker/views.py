@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import login
 from django.contrib.auth.mixins import LoginRequiredMixin
@@ -29,17 +30,22 @@ from tracker.forms import (
     TemplateForm,
     TrackForm,
 )
+from tracker.constants import SHEET_STATUSES, SHEET_STATUS_FROM_FULL, OpportunityStatus, Source
 from tracker.models import (
     ApplicationMaterial,
     ChecklistItem,
     Contact,
     Experience,
+    GmailAccount,
+    GmailProcessedMessage,
     InterviewStage,
     Opportunity,
     ProfileTrack,
     Project,
     SavedTemplate,
+    SimplifyListing,
     Task,
+    UserListingState,
 )
 from tracker.services.analytics import breakdown_explanation, dashboard_metrics
 from tracker.services.duplicates import find_duplicates
@@ -56,6 +62,17 @@ from tracker.services.matching import refresh_match
 from tracker.services.ownership import owned
 from tracker.services.skills import replace_opportunity_skills, replace_track_skills
 from tracker.services import ensure_profile
+from tracker.services.simplify import new_listing_count, should_resync, sync_listings
+from tracker.services.gmail import (
+    credentials_from_json,
+    credentials_to_json,
+    fetch_job_messages,
+    flow_for,
+    gmail_configured,
+    refresh_if_needed,
+)
+from tracker.services.gsheet import hint_from_mail, push_hints, spreadsheet_id_from_url
+from tracker.services.mailparse import apply_mail_hints, parse_message, parse_pasted_emails
 from tracker.services.workflow import (
     change_status,
     duplicate_opportunity,
@@ -67,7 +84,7 @@ from tracker.services.workflow import (
 class RegisterView(View):
     def get(self, request):
         if request.user.is_authenticated:
-            return redirect("dashboard")
+            return redirect("home")
         return render(request, "registration/register.html", {"form": RegisterForm()})
 
     def post(self, request):
@@ -78,8 +95,8 @@ class RegisterView(View):
             user.save(update_fields=["email"])
             ensure_profile(user)
             login(request, user)
-            messages.success(request, "Welcome. Start with your profile, then add a role.")
-            return redirect("profile")
+            messages.success(request, "Welcome. Add a row when you apply, or browse new openings.")
+            return redirect("home")
         return render(request, "registration/register.html", {"form": form})
 
 
@@ -113,26 +130,58 @@ class DashboardView(LoginRequiredMixin, TemplateView):
 
 class OpportunityListView(LoginRequiredMixin, View):
     def get(self, request):
-        form = OpportunityFilterForm(request.GET, user=request.user)
-        qs = Opportunity.objects.filter(user=request.user)
-        if request.GET.get("archived") != "1":
-            qs = qs.filter(is_archived=False)
-        if form.is_valid():
-            data = form.cleaned_data
-            if data.get("q"):
-                qs = qs.filter(Q(title__icontains=data["q"]) | Q(company__icontains=data["q"]) | Q(location__icontains=data["q"]))
-            for field in ("status", "match_category", "priority", "source", "work_arrangement", "sponsorship_status"):
-                if data.get(field):
-                    qs = qs.filter(**{field: data[field]})
-            if data.get("track"):
-                qs = qs.filter(selected_track_id=data["track"])
-        if request.GET.get("deadline"):
-            qs = qs.filter(deadline=request.GET["deadline"])
+        ensure_profile(request.user)
+        q = (request.GET.get("q") or "").strip()
+        status = request.GET.get("status") or ""
+        qs = Opportunity.objects.filter(user=request.user, is_archived=False).select_related("application")
+        if q:
+            qs = qs.filter(Q(title__icontains=q) | Q(company__icontains=q) | Q(location__icontains=q))
+        if status:
+            mapped = [key for key, value in SHEET_STATUS_FROM_FULL.items() if value == status]
+            qs = qs.filter(status__in=mapped or [status])
         return render(
             request,
             "opportunities/list.html",
-            {"opportunities": qs.select_related("selected_track"), "form": form},
+            {
+                "opportunities": qs,
+                "sheet_statuses": SHEET_STATUSES,
+                "q": q,
+                "status": status,
+                "status_counts": _sheet_counts(request.user),
+                "gmail_account": GmailAccount.objects.filter(user=request.user).first(),
+                "gmail_ready": gmail_configured(),
+            },
         )
+
+    def post(self, request):
+        company = (request.POST.get("company") or "").strip()
+        title = (request.POST.get("title") or "").strip()
+        url = (request.POST.get("url") or "").strip()
+        status = request.POST.get("status") or OpportunityStatus.SAVED
+        if not company or not title:
+            messages.error(request, "Company and role are enough to add a row.")
+            return redirect("opportunity_list")
+        opportunity = Opportunity.objects.create(
+            user=request.user,
+            company=company,
+            title=title,
+            url=url,
+            status=OpportunityStatus.SAVED,
+            source=Source.OTHER,
+        )
+        initialize_opportunity(opportunity)
+        if status != OpportunityStatus.SAVED:
+            change_status(opportunity, status, "Added from sheet")
+        messages.success(request, f"Added {title} at {company}.")
+        return redirect("opportunity_list")
+
+
+def _sheet_counts(user):
+    mapped = {value: 0 for value, _label in SHEET_STATUSES}
+    for status in Opportunity.objects.filter(user=user, is_archived=False).values_list("status", flat=True):
+        key = SHEET_STATUS_FROM_FULL.get(status, OpportunityStatus.SAVED)
+        mapped[key] = mapped.get(key, 0) + 1
+    return mapped
 
 
 class OpportunityBoardView(LoginRequiredMixin, View):
@@ -252,8 +301,118 @@ class StatusChangeView(LoginRequiredMixin, View):
         form = StatusForm(request.POST)
         if form.is_valid():
             change_status(opportunity, form.cleaned_data["status"], form.cleaned_data.get("note") or "")
-            messages.success(request, "Status updated.")
+            if not request.htmx:
+                messages.success(request, "Status updated.")
+        opportunity.refresh_from_db()
+        if request.htmx:
+            return render(
+                request,
+                "opportunities/_sheet_row.html",
+                {"opp": opportunity, "sheet_statuses": SHEET_STATUSES},
+            )
         return redirect(request.POST.get("next") or reverse("opportunity_detail", args=[pk]))
+
+
+class SheetNotesView(LoginRequiredMixin, View):
+    def post(self, request, pk):
+        opportunity = owned(Opportunity, request.user, pk)
+        opportunity.notes = (request.POST.get("notes") or "").strip()
+        opportunity.save(update_fields=["notes", "updated_at"])
+        if request.htmx:
+            return render(
+                request,
+                "opportunities/_sheet_row.html",
+                {"opp": opportunity, "sheet_statuses": SHEET_STATUSES},
+            )
+        return redirect("home")
+
+
+class OpeningsView(LoginRequiredMixin, View):
+    def get(self, request):
+        profile = ensure_profile(request.user)
+        error = ""
+        created = 0
+        if request.GET.get("refresh") == "1" or should_resync():
+            try:
+                result = sync_listings()
+                created = result["created"]
+            except Exception as exc:  # noqa: BLE001 — show a friendly fetch error
+                error = f"Could not refresh the GitHub list ({exc}). Showing the last saved copy."
+        last_viewed = profile.openings_last_viewed_at
+        listings = SimplifyListing.objects.filter(is_active=True)
+        q = (request.GET.get("q") or "").strip()
+        category = request.GET.get("category") or ""
+        if q:
+            listings = listings.filter(Q(company__icontains=q) | Q(title__icontains=q) | Q(location__icontains=q))
+        if category:
+            listings = listings.filter(category=category)
+        if request.GET.get("new") == "1":
+            if last_viewed:
+                listings = listings.filter(first_seen_at__gt=last_viewed)
+            else:
+                listings = listings.filter(age_days__lte=1)
+        saved_keys = set(
+            Opportunity.objects.filter(user=request.user).exclude(simplify_key="").values_list("simplify_key", flat=True)
+        )
+        hidden_ids = set(
+            UserListingState.objects.filter(user=request.user, hidden=True).values_list("listing_id", flat=True)
+        )
+        listings = listings.exclude(id__in=hidden_ids)[:250]
+        categories = (
+            SimplifyListing.objects.filter(is_active=True)
+            .exclude(category="")
+            .values_list("category", flat=True)
+            .distinct()
+            .order_by("category")
+        )
+        new_count = new_listing_count(request.user, last_viewed)
+        profile.openings_last_viewed_at = timezone.now()
+        profile.save(update_fields=["openings_last_viewed_at"])
+        return render(
+            request,
+            "openings/list.html",
+            {
+                "listings": listings,
+                "saved_keys": saved_keys,
+                "categories": categories,
+                "q": q,
+                "category": category,
+                "error": error,
+                "created": created,
+                "new_count": new_count,
+                "last_viewed": last_viewed,
+            },
+        )
+
+
+class OpeningSaveView(LoginRequiredMixin, View):
+    def post(self, request, pk):
+        listing = get_object_or_404(SimplifyListing, pk=pk)
+        applied = request.POST.get("applied") == "1"
+        existing = Opportunity.objects.filter(user=request.user, simplify_key=listing.listing_key).first()
+        if existing:
+            messages.info(request, "That role is already on your sheet.")
+            return redirect("home")
+        opportunity = Opportunity.objects.create(
+            user=request.user,
+            company=listing.company,
+            title=listing.title,
+            url=listing.apply_url,
+            location=listing.location,
+            source=Source.SIMPLIFY,
+            simplify_key=listing.listing_key,
+            notes=f"From SimplifyJobs · {listing.category}",
+        )
+        initialize_opportunity(opportunity)
+        if applied:
+            change_status(opportunity, OpportunityStatus.APPLIED, "Applied from openings list")
+        UserListingState.objects.update_or_create(
+            user=request.user,
+            listing=listing,
+            defaults={"opportunity": opportunity},
+        )
+        messages.success(request, f"{'Applied and saved' if applied else 'Saved'} {listing.title} at {listing.company}.")
+        return redirect(request.POST.get("next") or "home")
 
 
 class OpportunityArchiveView(LoginRequiredMixin, View):
@@ -692,3 +851,183 @@ class BriefExportView(LoginRequiredMixin, View):
         content = preparation_markdown(opportunity)
         filename = f"{opportunity.company}-{opportunity.title}-brief.md".replace(" ", "_")
         return HttpResponse(content, content_type="text/markdown", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+class GmailConnectView(LoginRequiredMixin, View):
+    def get(self, request):
+        account = GmailAccount.objects.filter(user=request.user).first()
+        sheet_id = ""
+        if account and account.spreadsheet_id:
+            sheet_id = account.spreadsheet_id
+        elif request.session.get("spreadsheet_id"):
+            sheet_id = request.session["spreadsheet_id"]
+        else:
+            sheet_id = getattr(settings, "GOOGLE_SHEET_ID", "")
+        return render(
+            request,
+            "gmail/connect.html",
+            {
+                "account": account,
+                "gmail_ready": gmail_configured(),
+                "spreadsheet_id": sheet_id,
+                "spreadsheet_url": f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit" if sheet_id else "",
+            },
+        )
+
+    def post(self, request):
+        sheet_url = request.POST.get("spreadsheet_url") or ""
+        if request.POST.get("save_sheet"):
+            sheet_id = spreadsheet_id_from_url(sheet_url)
+            if not sheet_id:
+                messages.error(request, "Paste the full Google Sheet link.")
+                return redirect("gmail_connect")
+            request.session["spreadsheet_id"] = sheet_id
+            account = GmailAccount.objects.filter(user=request.user).first()
+            if account:
+                account.spreadsheet_id = sheet_id
+                account.save(update_fields=["spreadsheet_id", "updated_at"])
+            messages.success(request, "Google Sheet saved. Sync will write to the internships and newgrad tabs.")
+            return redirect("gmail_connect")
+        pasted = request.POST.get("pasted") or ""
+        if pasted.strip():
+            hints = parse_pasted_emails(pasted)
+            result = apply_mail_hints(request.user, hints)
+            sheet_result = _push_mail_hints(request, hints)
+            extra = ""
+            if sheet_result:
+                extra = f" Google Sheet: added {sheet_result['created']}, updated {sheet_result['updated']}."
+            messages.success(
+                request,
+                f"Read {len(hints)} recruiter emails. Added {result['created']}, updated {result['updated']}.{extra}",
+            )
+            return redirect("home")
+        if not gmail_configured():
+            messages.error(request, "Add Google OAuth keys to .env first, or paste emails below.")
+            return redirect("gmail_connect")
+        import os
+
+        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+        flow = flow_for(request)
+        authorization_url, state = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+        request.session["gmail_oauth_state"] = state
+        return redirect(authorization_url)
+
+
+class GmailCallbackView(LoginRequiredMixin, View):
+    def get(self, request):
+        if not gmail_configured():
+            return redirect("gmail_connect")
+        import os
+
+        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+        flow = flow_for(request)
+        try:
+            flow.fetch_token(authorization_response=request.build_absolute_uri())
+        except Exception as exc:  # noqa: BLE001
+            messages.error(request, f"Google login did not finish ({exc}).")
+            return redirect("gmail_connect")
+        creds = flow.credentials
+        sheet_id = request.session.get("spreadsheet_id") or getattr(settings, "GOOGLE_SHEET_ID", "")
+        GmailAccount.objects.update_or_create(
+            user=request.user,
+            defaults={
+                "token_json": credentials_to_json(creds),
+                "email": request.user.email,
+                "spreadsheet_id": sheet_id,
+            },
+        )
+        messages.success(request, "Gmail connected. Syncing recruiter mail…")
+        return redirect("gmail_sync")
+
+
+class GmailDisconnectView(LoginRequiredMixin, View):
+    def post(self, request):
+        GmailAccount.objects.filter(user=request.user).delete()
+        messages.success(request, "Gmail disconnected.")
+        return redirect("gmail_connect")
+
+
+class GmailSyncView(LoginRequiredMixin, View):
+    def get(self, request):
+        return self.post(request)
+
+    def post(self, request):
+        account = GmailAccount.objects.filter(user=request.user).first()
+        if not account:
+            messages.info(request, "Connect Gmail first.")
+            return redirect("gmail_connect")
+        try:
+            creds = refresh_if_needed(credentials_from_json(account.token_json))
+            account.token_json = credentials_to_json(creds)
+            raw_messages = fetch_job_messages(creds)
+        except Exception as exc:  # noqa: BLE001
+            messages.error(request, f"Gmail sync failed ({exc}).")
+            return redirect("gmail_connect")
+        hints = []
+        bodies: list[str] = []
+        dates: list[str] = []
+        for item in raw_messages:
+            if GmailProcessedMessage.objects.filter(user=request.user, message_id=item["id"]).exists():
+                continue
+            hint = parse_message(item["from"], item["subject"], item["body"], item["id"])
+            GmailProcessedMessage.objects.get_or_create(user=request.user, message_id=item["id"])
+            if hint:
+                hints.append(hint)
+                bodies.append(item.get("body") or "")
+                dates.append(_mail_date(item.get("date") or ""))
+        result = apply_mail_hints(request.user, hints)
+        sheet_result = None
+        sheet_id = account.spreadsheet_id or request.session.get("spreadsheet_id") or getattr(settings, "GOOGLE_SHEET_ID", "")
+        if sheet_id and hints:
+            try:
+                sheet_hints = [
+                    hint_from_mail(hint.company, hint.title, hint.status, hint.note, body, date_applied)
+                    for hint, body, date_applied in zip(hints, bodies, dates)
+                ]
+                sheet_result = push_hints(creds, sheet_id, sheet_hints)
+                account.spreadsheet_id = sheet_id
+            except Exception as exc:  # noqa: BLE001
+                messages.error(request, f"Gmail read worked, but the Google Sheet update failed ({exc}).")
+        account.last_synced_at = timezone.now()
+        account.save(update_fields=["token_json", "last_synced_at", "spreadsheet_id"])
+        extra = ""
+        if sheet_result:
+            extra = f" Google Sheet: added {sheet_result['created']}, updated {sheet_result['updated']}."
+        messages.success(
+            request,
+            f"Gmail sync complete. {len(hints)} useful emails → added {result['created']}, updated {result['updated']}.{extra}",
+        )
+        return redirect("home")
+
+
+def _mail_date(raw: str) -> str:
+    from email.utils import parsedate_to_datetime
+
+    if not raw:
+        return timezone.localdate().isoformat()
+    try:
+        return parsedate_to_datetime(raw).date().isoformat()
+    except (TypeError, ValueError, OverflowError):
+        return timezone.localdate().isoformat()
+
+
+def _push_mail_hints(request, hints):
+    account = GmailAccount.objects.filter(user=request.user).first()
+    sheet_id = ""
+    if account and account.spreadsheet_id:
+        sheet_id = account.spreadsheet_id
+    else:
+        sheet_id = request.session.get("spreadsheet_id") or getattr(settings, "GOOGLE_SHEET_ID", "")
+    if not sheet_id or not hints or not account:
+        return None
+    try:
+        creds = refresh_if_needed(credentials_from_json(account.token_json))
+        sheet_hints = [hint_from_mail(hint.company, hint.title, hint.status, hint.note) for hint in hints]
+        return push_hints(creds, sheet_id, sheet_hints)
+    except Exception:  # noqa: BLE001
+        return None
+

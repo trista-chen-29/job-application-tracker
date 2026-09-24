@@ -67,6 +67,7 @@ class Profile(TimeStampedModel):
         default=SponsorshipPreference.NOT_NEEDED,
     )
     professional_pitch = models.TextField(blank=True)
+    openings_last_viewed_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self) -> str:
         return self.full_name or self.user.get_username()
@@ -190,9 +191,9 @@ class ApplicationMaterial(TimeStampedModel):
 
 class Opportunity(TimeStampedModel):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="opportunities")
-    title = models.CharField(max_length=200)
+    title = models.CharField(max_length=300)
     company = models.CharField(max_length=200)
-    url = models.URLField(blank=True)
+    url = models.URLField(max_length=1000, blank=True)
     source = models.CharField(max_length=32, choices=Source.choices, default=Source.OTHER)
     location = models.CharField(max_length=200, blank=True)
     work_arrangement = models.CharField(
@@ -236,6 +237,7 @@ class Opportunity(TimeStampedModel):
     )
     match_payload = models.JSONField(default=dict, blank=True)
     last_status_changed_at = models.DateTimeField(default=timezone.now)
+    simplify_key = models.CharField(max_length=64, blank=True, db_index=True)
 
     class Meta:
         ordering = ["-updated_at"]
@@ -421,3 +423,60 @@ def ensure_default_checklist(opportunity: Opportunity) -> None:
         for index, (key, label) in enumerate(DEFAULT_CHECKLIST)
     ]
     ChecklistItem.objects.bulk_create(items)
+
+
+class SimplifyListing(TimeStampedModel):
+    listing_key = models.CharField(max_length=64, unique=True)
+    company = models.CharField(max_length=200)
+    title = models.CharField(max_length=300)
+    location = models.CharField(max_length=400, blank=True)
+    apply_url = models.URLField(max_length=1000, blank=True)
+    category = models.CharField(max_length=80, blank=True)
+    age_label = models.CharField(max_length=16, blank=True)
+    age_days = models.PositiveIntegerField(null=True, blank=True)
+    first_seen_at = models.DateTimeField(default=timezone.now)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["age_days", "-first_seen_at"]
+
+    def __str__(self) -> str:
+        return f"{self.company} · {self.title}"
+
+
+class UserListingState(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="listing_states")
+    listing = models.ForeignKey(SimplifyListing, on_delete=models.CASCADE, related_name="user_states")
+    opportunity = models.ForeignKey(
+        Opportunity,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="listing_states",
+    )
+    hidden = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "listing"], name="unique_user_listing"),
+        ]
+
+
+class GmailAccount(TimeStampedModel):
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="gmail_account")
+    email = models.EmailField(blank=True)
+    token_json = models.TextField()
+    spreadsheet_id = models.CharField(max_length=80, blank=True)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+
+
+class GmailProcessedMessage(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="gmail_messages")
+    message_id = models.CharField(max_length=128)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "message_id"], name="unique_user_gmail_message"),
+        ]

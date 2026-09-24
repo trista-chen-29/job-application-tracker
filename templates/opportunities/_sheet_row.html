@@ -1,0 +1,31 @@
+{% load sheet_tags %}
+<tr id="row-{{ opp.pk }}">
+  <td data-label="Company">
+    <strong>{{ opp.company }}</strong>
+    {% if opp.location %}<div class="muted">{{ opp.location }}</div>{% endif %}
+  </td>
+  <td data-label="Role">
+    {{ opp.title }}
+    {% if opp.url %}<div><a href="{{ opp.url }}" target="_blank" rel="noopener">Posting</a></div>{% endif %}
+  </td>
+  <td data-label="Status">
+    <form method="post" action="{% url 'opportunity_status' opp.pk %}" hx-post="{% url 'opportunity_status' opp.pk %}" hx-target="#row-{{ opp.pk }}" hx-swap="outerHTML">
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{% url 'home' %}">
+      <select name="status" class="input select status-{{ opp.status|as_sheet_status }}" onchange="this.form.requestSubmit()">
+        {% for value, label in sheet_statuses %}
+          <option value="{{ value }}" {% if opp.status|as_sheet_status == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </form>
+  </td>
+  <td data-label="Applied">
+    {% if opp.application.applied_at %}{{ opp.application.applied_at|date:"M j" }}{% else %}—{% endif %}
+  </td>
+  <td data-label="Notes">
+    <form method="post" action="{% url 'opportunity_notes' opp.pk %}" hx-post="{% url 'opportunity_notes' opp.pk %}" hx-trigger="change delay:400ms" hx-target="#row-{{ opp.pk }}" hx-swap="outerHTML">
+      {% csrf_token %}
+      <input class="input" name="notes" value="{{ opp.notes }}" placeholder="Note">
+    </form>
+  </td>
+</tr>

@@ -1,5 +1,8 @@
 Django>=6.1,<7
 django-htmx>=1.29
 python-dotenv>=1.0
+google-api-python-client>=2.0
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2
 # Optional production database driver:
 # psycopg[binary]>=3.2

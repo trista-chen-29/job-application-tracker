@@ -105,7 +105,6 @@ MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
 LOGIN_URL = "login"
-LOGIN_REDIRECT_URL = "dashboard"
 LOGOUT_REDIRECT_URL = "login"
 
 MAILERS = {
@@ -123,3 +122,21 @@ DEFAULT_FROM_EMAIL = os.environ.get("DJANGO_DEFAULT_FROM_EMAIL", "tracker@localh
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 ALLOWED_MATERIAL_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt", ".md", ".png", ".jpg", ".jpeg"}
 ANALYTICS_MIN_SAMPLE = 5
+SIMPLIFY_README_URL = os.environ.get(
+    "SIMPLIFY_README_URL",
+    "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/README.md",
+)
+SIMPLIFY_SYNC_MINUTES = int(os.environ.get("SIMPLIFY_SYNC_MINUTES", "30"))
+LOGIN_REDIRECT_URL = "home"
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI", "")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "DJANGO_CSRF_TRUSTED_ORIGINS",
+        "http://127.0.0.1:8002,http://localhost:8002,http://127.0.0.1:8000,http://localhost:8000",
+    ).split(",")
+    if origin.strip()
+]
