@@ -44,11 +44,36 @@ def result_label(status: str) -> str:
     return RESULT_LABEL.get(status, "Applied")
 
 
+INTERNSHIP_ROLE_RE = re.compile(r"\b(?:intern(?:ship)?s?|co-?ops?)\b", re.I)
+NEWGRAD_ROLE_RE = re.compile(
+    r"\b(?:new[\s-]?grads?(?:uate)?s?|university[\s-]?grads?(?:uate)?s?|early[\s-]?career|full[\s-]?time)\b",
+    re.I,
+)
+
+
+GENERIC_INTERN_TITLES = {"intern", "internship", "internships", "co-op", "coop", "co op"}
+
+
 def choose_tab(title: str, body: str = "") -> str:
-    blob = f"{title}\n{body}".lower()
-    if re.search(r"new[\s-]?grad|university grad|full[\s-]?time", blob) and "intern" not in blob:
+    title_text = title or ""
+    if INTERNSHIP_ROLE_RE.search(title_text) and title_text.strip().lower() not in GENERIC_INTERN_TITLES:
+        return INTERNSHIPS_TAB
+    if NEWGRAD_ROLE_RE.search(title_text):
+        return NEWGRAD_TAB
+    blob = f"{title_text}\n{(body or '')[:2500]}"
+    if INTERNSHIP_ROLE_RE.search(blob) and not NEWGRAD_ROLE_RE.search(blob):
+        return INTERNSHIPS_TAB
+    if NEWGRAD_ROLE_RE.search(blob) and not INTERNSHIP_ROLE_RE.search(blob):
+        return NEWGRAD_TAB
+    if INTERNSHIP_ROLE_RE.search(blob):
+        return INTERNSHIPS_TAB
+    if NEWGRAD_ROLE_RE.search(blob):
         return NEWGRAD_TAB
     return INTERNSHIPS_TAB
+
+
+def other_tab(tab: str) -> str:
+    return NEWGRAD_TAB if tab == INTERNSHIPS_TAB else INTERNSHIPS_TAB
 
 
 def infer_location(body: str) -> str:
@@ -173,7 +198,7 @@ def upsert_plan(rows: list[list[str]], hint: SheetHint) -> dict:
         return {"action": "skipped", "row": match_row}
     return {
         "action": "create",
-        "row": first_empty_company_row(rows, company_col),
+        "row": 2,
         "hint": hint,
     }
 
@@ -229,6 +254,41 @@ def _merged_row(headers: list[str], hint: SheetHint, existing: list[str] | None,
     return row
 
 
+def sort_filled_latest_first(rows: list[list[str]]) -> list[list[str]]:
+    if len(rows) < 2:
+        return rows
+    headers = rows[0]
+    company_col = header_index(headers, ("company",))
+    date_col = header_index(headers, ("date applied", "applied", "date"))
+    filled: list[list[str]] = []
+    empty: list[list[str]] = []
+    for row in rows[1:]:
+        company = row[company_col] if company_col >= 0 and company_col < len(row) else ""
+        if str(company).strip():
+            filled.append(row)
+        else:
+            empty.append(row)
+
+    def date_key(row: list[str]) -> str:
+        if date_col < 0 or date_col >= len(row):
+            return ""
+        return str(row[date_col] or "")
+
+    filled.sort(key=date_key, reverse=True)
+    return [headers] + filled + empty
+
+
+def _blank_identity_row(headers: list[str], existing: list[str]) -> list[str]:
+    row = list(existing)
+    while len(row) < len(headers):
+        row.append("")
+    for names in (("company",), ("role", "title", "position"), ("date applied", "applied", "date"), ("location",), ("notes", "note")):
+        col = header_index(headers, names)
+        if col >= 0:
+            row[col] = ""
+    return row
+
+
 def _sheets_execute(request):
     import time
 
@@ -258,7 +318,7 @@ def push_hints(creds, spreadsheet_id: str, hints: list[SheetHint]) -> dict:
     if not spreadsheet_id or not hints:
         return {"created": created, "updated": updated, "skipped": skipped}
     service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    tabs = {hint.tab for hint in hints}
+    tabs = {INTERNSHIPS_TAB, NEWGRAD_TAB} | {hint.tab for hint in hints}
     grids: dict[str, list[list[str]]] = {}
     for tab in tabs:
         payload = _sheets_execute(
@@ -268,25 +328,46 @@ def push_hints(creds, spreadsheet_id: str, hints: list[SheetHint]) -> dict:
         )
         grids[tab] = payload.get("values") or [["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"]]
     writes: list[dict] = []
+    dirty_tabs: set[str] = set()
     for hint in hints:
-        plan = upsert_plan(grids[hint.tab], hint)
+        plan = upsert_plan(grids.get(hint.tab) or grids[INTERNSHIPS_TAB], hint)
+        if plan["action"] == "create":
+            alt = other_tab(hint.tab)
+            if alt in grids:
+                other_plan = upsert_plan(grids[alt], hint)
+                if other_plan.get("row") and other_plan["action"] != "create":
+                    from_row = other_plan["row"]
+                    headers_from = grids[alt][0]
+                    existing = list(grids[alt][from_row - 1]) if from_row < len(grids[alt]) else []
+                    merged = _merged_row(headers_from, hint, existing, hint.tab)
+                    grids[hint.tab].insert(1, merged)
+                    grids[alt][from_row - 1] = _blank_identity_row(headers_from, existing)
+                    dirty_tabs.add(hint.tab)
+                    dirty_tabs.add(alt)
+                    updated += 1
+                    continue
         action = plan["action"]
         if action == "skipped":
             skipped += 1
             continue
-        row_number = plan["row"]
         headers = grids[hint.tab][0]
-        while len(grids[hint.tab]) < row_number:
-            grids[hint.tab].append([""] * max(len(headers), 7))
-        existing = list(grids[hint.tab][row_number - 1])
-        merged = _merged_row(headers, hint, existing, hint.tab)
-        last_col = _col_letter(max(len(headers) - 1, 0))
-        writes.append({"range": f"'{hint.tab}'!A{row_number}:{last_col}{row_number}", "values": [merged]})
-        grids[hint.tab][row_number - 1] = merged
+        width = max(len(headers), 7)
         if action == "create":
+            merged = _merged_row(headers, hint, [""] * width, hint.tab)
+            grids[hint.tab].insert(1, merged)
             created += 1
         else:
+            row_number = plan["row"]
+            while len(grids[hint.tab]) < row_number:
+                grids[hint.tab].append([""] * width)
+            existing = list(grids[hint.tab][row_number - 1])
+            grids[hint.tab][row_number - 1] = _merged_row(headers, hint, existing, hint.tab)
             updated += 1
+        dirty_tabs.add(hint.tab)
+    for tab in dirty_tabs:
+        grid = sort_filled_latest_first(grids[tab])
+        last_col = _col_letter(max(len(grid[0]) - 1, 0))
+        writes.append({"range": f"'{tab}'!A1:{last_col}{len(grid)}", "values": grid})
     if writes:
         _sheets_execute(
             service.spreadsheets()

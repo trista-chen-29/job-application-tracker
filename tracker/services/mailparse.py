@@ -230,7 +230,7 @@ def _norm_company(name: str) -> str:
     return text
 
 
-PARSER_VERSION = 3
+PARSER_VERSION = 4
 
 
 def _title_tokens(title: str) -> set[str]:

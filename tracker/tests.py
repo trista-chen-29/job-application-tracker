@@ -459,6 +459,20 @@ class GoogleSheetFillTests(TestCase):
         self.assertEqual(plan["action"], "create")
         self.assertEqual(plan["row"], 2)
 
+    def test_newest_applied_rows_sort_to_the_top(self):
+        from tracker.services.gsheet import sort_filled_latest_first
+
+        rows = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["2026-01-01", "OldCo", "Intern", "", "Summer 2027", "Applied", ""],
+            ["2026-09-24", "Graphcore", "Firmware Engineering Intern", "", "Summer 2027", "Applied", ""],
+            ["", "", "", "", "Summer 2027", "Applied", ""],
+        ]
+        sorted_rows = sort_filled_latest_first(rows)
+        self.assertEqual(sorted_rows[1][1], "Graphcore")
+        self.assertEqual(sorted_rows[2][1], "OldCo")
+        self.assertEqual(sorted_rows[3][1], "")
+
     def test_new_grad_goes_to_newgrad_tab(self):
         from tracker.constants import OpportunityStatus
         from tracker.services.gsheet import hint_from_mail
@@ -471,6 +485,32 @@ class GoogleSheetFillTests(TestCase):
             "Thanks for applying to our new grad program.",
         )
         self.assertEqual(hint.tab, "newgrad")
+
+    def test_interview_word_does_not_force_internships_tab(self):
+        from tracker.constants import OpportunityStatus
+        from tracker.services.gsheet import hint_from_mail
+
+        hint = hint_from_mail(
+            "Nvidia",
+            "Software Engineer, University Grad",
+            OpportunityStatus.APPLIED,
+            "note",
+            "Thank you for applying. Next steps in our interview process will follow for this full-time new grad role.",
+        )
+        self.assertEqual(hint.tab, "newgrad")
+
+    def test_firmware_intern_stays_on_internships_tab(self):
+        from tracker.constants import OpportunityStatus
+        from tracker.services.gsheet import hint_from_mail
+
+        hint = hint_from_mail(
+            "Graphcore",
+            "Firmware Engineering Intern",
+            OpportunityStatus.APPLIED,
+            "note",
+            "We have received your application for the position of Firmware Engineering Intern.",
+        )
+        self.assertEqual(hint.tab, "internships")
 
     def test_rejection_does_not_replace_offer_on_sheet(self):
         from tracker.services.gsheet import SheetHint, upsert_plan

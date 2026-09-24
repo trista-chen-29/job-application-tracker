@@ -68,6 +68,8 @@ function recheckScraped() {
     else skipped += 1;
   });
   props.setProperty('recheckOffset', String(start + batch.length));
+  sortNewestAppliedFirst(CONFIG.internshipsTab);
+  sortNewestAppliedFirst(CONFIG.newgradTab);
   const left = ids.length - (start + batch.length);
   SpreadsheetApp.getActive().toast(
     'Rechecked ' + batch.length + ': added ' + created + ', updated ' + updated + ', skipped ' + skipped +
@@ -118,6 +120,9 @@ function syncGmail() {
     });
   });
 
+  sortNewestAppliedFirst(CONFIG.internshipsTab);
+  sortNewestAppliedFirst(CONFIG.newgradTab);
+
   SpreadsheetApp.getActive().toast(
     'Added ' + created + ', updated ' + updated + ', skipped ' + skipped,
     'Gmail sync',
@@ -151,11 +156,12 @@ function parseMessage(fromHeader, subject, body, date) {
   const status = inferStatus(text);
   const company = inferCompany(fromHeader, subject, body);
   if (!status || !company) return null;
+    const role = inferTitle(subject, body);
   return {
     company: company.slice(0, 200),
-    role: inferTitle(subject, body),
+    role: role,
     location: inferLocation(body),
-    tab: chooseTab(subject + '\n' + body),
+    tab: chooseTab(role, subject + '\n' + body),
     result: status,
     notes: 'From email: ' + String(subject || '').slice(0, 180),
     dateApplied: formatDate(date),
@@ -271,23 +277,67 @@ function inferLocation(body) {
   return match[1].split('\n')[0].trim().slice(0, 80);
 }
 
-function chooseTab(text) {
-  const blob = String(text || '').toLowerCase();
-  if (/(new[\s-]?grad|university grad|full[\s-]?time)/.test(blob) && !/intern/.test(blob)) {
-    return CONFIG.newgradTab;
-  }
+function chooseTab(title, body) {
+  const role = String(title || '').trim();
+  const genericIntern = /^(intern(?:ship)?s?|co-?ops?)$/i.test(role);
+  if (isInternRole(role) && !genericIntern) return CONFIG.internshipsTab;
+  if (isNewGradRole(role)) return CONFIG.newgradTab;
+  const blob = role + '\n' + String(body || '').slice(0, 2500);
+  const intern = isInternRole(blob);
+  const grad = isNewGradRole(blob);
+  if (intern && !grad) return CONFIG.internshipsTab;
+  if (grad && !intern) return CONFIG.newgradTab;
+  if (intern) return CONFIG.internshipsTab;
+  if (grad) return CONFIG.newgradTab;
   return CONFIG.internshipsTab;
 }
 
+function isInternRole(text) {
+  return /\b(?:intern(?:ship)?s?|co-?ops?)\b/i.test(String(text || ''));
+}
+
+function isNewGradRole(text) {
+  return /\b(?:new[\s-]?grads?(?:uate)?s?|university[\s-]?grads?(?:uate)?s?|early[\s-]?career|full[\s-]?time)\b/i.test(
+    String(text || '')
+  );
+}
+
+function otherTab(tab) {
+  return tab === CONFIG.internshipsTab ? CONFIG.newgradTab : CONFIG.internshipsTab;
+}
+
 function applyHint(hint) {
-  const sheet = SpreadsheetApp.getActive().getSheetByName(hint.tab);
-  if (!sheet) return 'skipped';
-  const cols = headerMap(sheet);
+  const intended = SpreadsheetApp.getActive().getSheetByName(hint.tab);
+  if (!intended) return 'skipped';
+  const cols = headerMap(intended);
   if (cols.company < 0 || cols.result < 0) return 'skipped';
-  const last = Math.max(sheet.getLastRow(), 2);
-  const width = sheet.getLastColumn();
-  const values = sheet.getRange(1, 1, last, width).getDisplayValues();
-  const matchRow = findCompanyRow(values, cols.company, hint.company);
+  let sheet = intended;
+  let last = Math.max(sheet.getLastRow(), 2);
+  let width = sheet.getLastColumn();
+  let values = sheet.getRange(1, 1, last, width).getDisplayValues();
+  let matchRow = findCompanyRow(values, cols.company, hint.company);
+  if (matchRow <= 0) {
+    const alt = SpreadsheetApp.getActive().getSheetByName(otherTab(hint.tab));
+    if (alt) {
+      const altCols = headerMap(alt);
+      const altLast = Math.max(alt.getLastRow(), 2);
+      const altWidth = alt.getLastColumn();
+      const altValues = alt.getRange(1, 1, altLast, altWidth).getDisplayValues();
+      const altRow = findCompanyRow(altValues, altCols.company, hint.company);
+      if (altRow > 0) {
+        sheet.insertRowBefore(2);
+        writeCell(sheet, 2, cols.date, hint.dateApplied || (altCols.date >= 0 ? altValues[altRow - 1][altCols.date] : ''));
+        writeCell(sheet, 2, cols.company, hint.company);
+        writeCell(sheet, 2, cols.role, hint.role || (altCols.role >= 0 ? altValues[altRow - 1][altCols.role] : ''));
+        if (cols.location >= 0) writeCell(sheet, 2, cols.location, hint.location || '');
+        if (cols.season >= 0) writeCell(sheet, 2, cols.season, hint.season || CONFIG.defaultSeason);
+        writeCell(sheet, 2, cols.result, hint.result || (altCols.result >= 0 ? altValues[altRow - 1][altCols.result] : 'Applied'));
+        if (altCols.company >= 0) alt.getRange(altRow, altCols.company + 1).setValue('');
+        if (altCols.role >= 0) alt.getRange(altRow, altCols.role + 1).setValue('');
+        return 'updated';
+      }
+    }
+  }
   if (matchRow > 0) {
     const current = String(values[matchRow - 1][cols.result] || '');
     const currentRole = cols.role >= 0 ? String(values[matchRow - 1][cols.role] || '') : '';
@@ -309,15 +359,40 @@ function applyHint(hint) {
     }
     return changed ? 'updated' : 'skipped';
   }
-  const emptyRow = firstEmptyCompanyRow(values, cols.company);
+  const emptyRow = 2;
+  sheet.insertRowBefore(2);
   writeCell(sheet, emptyRow, cols.date, hint.dateApplied);
   writeCell(sheet, emptyRow, cols.company, hint.company);
   writeCell(sheet, emptyRow, cols.role, hint.role);
   if (cols.location >= 0 && hint.location) writeCell(sheet, emptyRow, cols.location, hint.location);
-  if (cols.season >= 0) writeCell(sheet, emptyRow, cols.season, hint.season);
+  if (cols.season >= 0) writeCell(sheet, emptyRow, cols.season, hint.season || CONFIG.defaultSeason);
   writeCell(sheet, emptyRow, cols.result, hint.result);
   if (cols.notes >= 0) writeCell(sheet, emptyRow, cols.notes, hint.notes);
   return 'created';
+}
+
+function sortNewestAppliedFirst(tabName) {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(tabName);
+  if (!sheet) return;
+  const cols = headerMap(sheet);
+  if (cols.company < 0) return;
+  const last = sheet.getLastRow();
+  const width = sheet.getLastColumn();
+  if (last < 3) return;
+  const values = sheet.getRange(2, 1, last - 1, width).getValues();
+  const filled = [];
+  const blank = [];
+  values.forEach((row) => {
+    if (String(row[cols.company] || '').trim()) filled.push(row);
+    else blank.push(row);
+  });
+  filled.sort((a, b) => {
+    const da = cols.date >= 0 ? new Date(a[cols.date] || 0).getTime() : 0;
+    const db = cols.date >= 0 ? new Date(b[cols.date] || 0).getTime() : 0;
+    return db - da;
+  });
+  const combined = filled.concat(blank);
+  sheet.getRange(2, 1, combined.length, width).setValues(combined);
 }
 
 function headerMap(sheet) {
