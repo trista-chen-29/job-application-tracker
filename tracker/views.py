@@ -986,7 +986,13 @@ class GmailSyncView(LoginRequiredMixin, View):
         dates: list[str] = []
         scanned = len(raw_messages)
         for item in raw_messages:
-            hint = parse_message(item["from"], item["subject"], item["body"], item["id"])
+            hint = parse_message(
+                item["from"],
+                item["subject"],
+                item["body"],
+                item["id"],
+                item.get("threadId") or "",
+            )
             record, _created = GmailProcessedMessage.objects.get_or_create(
                 user=request.user, message_id=item["id"]
             )
@@ -1001,7 +1007,15 @@ class GmailSyncView(LoginRequiredMixin, View):
         sheet_result = None
         sheet_id = account.spreadsheet_id or request.session.get("spreadsheet_id") or getattr(settings, "GOOGLE_SHEET_ID", "")
         sheet_hints = [
-            hint_from_mail(hint.company, hint.title, hint.status, hint.note, body, date_applied)
+            hint_from_mail(
+                hint.company,
+                hint.title,
+                hint.status,
+                hint.note,
+                body,
+                date_applied,
+                hint.thread_id,
+            )
             for hint, body, date_applied in zip(hints, bodies, dates)
         ]
         if sheet_id:
@@ -1053,7 +1067,13 @@ class GmailRecheckView(LoginRequiredMixin, View):
         bodies: list[str] = []
         dates: list[str] = []
         for item in raw_messages:
-            hint = parse_message(item["from"], item["subject"], item["body"], item["id"])
+            hint = parse_message(
+                item["from"],
+                item["subject"],
+                item["body"],
+                item["id"],
+                item.get("threadId") or "",
+            )
             record, _created = GmailProcessedMessage.objects.get_or_create(
                 user=request.user, message_id=item["id"]
             )
@@ -1068,7 +1088,15 @@ class GmailRecheckView(LoginRequiredMixin, View):
         sheet_id = account.spreadsheet_id or request.session.get("spreadsheet_id") or getattr(settings, "GOOGLE_SHEET_ID", "")
         if sheet_id:
             sheet_hints = [
-                hint_from_mail(hint.company, hint.title, hint.status, hint.note, body, date_applied)
+                hint_from_mail(
+                    hint.company,
+                    hint.title,
+                    hint.status,
+                    hint.note,
+                    body,
+                    date_applied,
+                    hint.thread_id,
+                )
                 for hint, body, date_applied in zip(hints, bodies, dates)
             ]
             sheet_hints.extend(_local_opportunity_hints(request.user))
@@ -1094,13 +1122,13 @@ class GmailRecheckView(LoginRequiredMixin, View):
 
 
 def _local_opportunity_hints(user):
-    from tracker.services.gsheet import hint_from_mail
+    from tracker.services.gsheet import format_applied_date, hint_from_mail
 
     hints = []
     for opp in Opportunity.objects.filter(user=user, is_archived=False).select_related("application"):
         applied = ""
         if getattr(opp, "application", None) and opp.application.applied_at:
-            applied = timezone.localdate(opp.application.applied_at).isoformat()
+            applied = format_applied_date(timezone.localdate(opp.application.applied_at).isoformat())
         hints.append(
             hint_from_mail(
                 opp.company,
@@ -1116,12 +1144,14 @@ def _local_opportunity_hints(user):
 def _mail_date(raw: str) -> str:
     from email.utils import parsedate_to_datetime
 
+    from tracker.services.gsheet import format_applied_date
+
     if not raw:
-        return timezone.localdate().isoformat()
+        return format_applied_date(timezone.localdate().isoformat())
     try:
-        return parsedate_to_datetime(raw).date().isoformat()
+        return format_applied_date(parsedate_to_datetime(raw).date().isoformat())
     except (TypeError, ValueError, OverflowError):
-        return timezone.localdate().isoformat()
+        return format_applied_date(timezone.localdate().isoformat())
 
 
 def _push_mail_hints(request, hints):

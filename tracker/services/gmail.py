@@ -189,6 +189,7 @@ def fetch_job_messages(creds, newer_than_days: int = 730, limit: int = 40, skip_
         messages.append(
             {
                 "id": full.get("id"),
+                "threadId": full.get("threadId") or "",
                 "from": headers.get("from", ""),
                 "subject": headers.get("subject", ""),
                 "date": headers.get("date", ""),
@@ -218,6 +219,7 @@ def fetch_messages_by_ids(creds, message_ids: list[str], limit: int = 15) -> lis
         messages.append(
             {
                 "id": full.get("id"),
+                "threadId": full.get("threadId") or "",
                 "from": headers.get("from", ""),
                 "subject": headers.get("subject", ""),
                 "date": headers.get("date", ""),

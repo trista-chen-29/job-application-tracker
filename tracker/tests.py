@@ -455,6 +455,7 @@ class GoogleSheetFillTests(TestCase):
         self.assertEqual(hint.tab, "internships")
         self.assertEqual(hint.result, "Applied")
         self.assertEqual(hint.location, "New York, NY")
+        self.assertEqual(hint.date_applied, "09/24/2026")
         plan = upsert_plan(rows, hint)
         self.assertEqual(plan["action"], "create")
         self.assertEqual(plan["row"], 2)
@@ -499,6 +500,45 @@ class GoogleSheetFillTests(TestCase):
         )
         self.assertEqual(hint.tab, "newgrad")
 
+    def test_generic_swe_confirmation_goes_to_newgrad_tab(self):
+        from tracker.constants import OpportunityStatus
+        from tracker.services.gsheet import hint_from_mail
+
+        hint = hint_from_mail(
+            "Meta",
+            "Software Engineer",
+            OpportunityStatus.APPLIED,
+            "From email: Thank you for applying to Meta",
+            "We have received your application for Software Engineer.",
+        )
+        self.assertEqual(hint.tab, "newgrad")
+
+    def test_default_internship_title_with_new_grad_body_goes_to_newgrad(self):
+        from tracker.constants import OpportunityStatus
+        from tracker.services.gsheet import hint_from_mail
+
+        hint = hint_from_mail(
+            "Jane Street",
+            "Internship",
+            OpportunityStatus.APPLIED,
+            "From email: Thank you for applying",
+            "Thanks for applying to our new grad software engineer role. Interviews will follow.",
+        )
+        self.assertEqual(hint.tab, "newgrad")
+
+    def test_intern_and_new_grad_in_body_prefers_newgrad_unless_intern_title(self):
+        from tracker.constants import OpportunityStatus
+        from tracker.services.gsheet import hint_from_mail
+
+        mixed = hint_from_mail(
+            "Google",
+            "Software Engineer",
+            OpportunityStatus.APPLIED,
+            "note",
+            "We are hiring interns and university grads. This is for our university grad program.",
+        )
+        self.assertEqual(mixed.tab, "newgrad")
+
     def test_firmware_intern_stays_on_internships_tab(self):
         from tracker.constants import OpportunityStatus
         from tracker.services.gsheet import hint_from_mail
@@ -528,6 +568,56 @@ class GoogleSheetFillTests(TestCase):
             notes="Unfortunately",
             date_applied="2026-09-24",
         )
+        plan = upsert_plan(rows, hint)
+        self.assertEqual(plan["action"], "skipped")
+
+    def test_databricks_intern_email_fills_like_manual_entry(self):
+        from tracker.constants import OpportunityStatus
+        from tracker.services.gsheet import hint_from_mail
+        from tracker.services.mailparse import parse_message
+
+        body = (
+            "Hi Yi-Chi,\n\n"
+            "Thanks for applying to Databricks! Your application for the Software Engineering Intern "
+            "(2027 Start) - Winter role has been received. We will review it shortly and reach out if there is a fit.\n\n"
+            "Please note that all official communication from Databricks will come from email addresses "
+            "ending with @databricks.com or @goodtime.io (our meeting tool).\n\n"
+            "Regards,\nDatabricks\n\n"
+            "** Please note: Do not reply to this email. This email is sent from an unattended mailbox. Replies will not be read."
+        )
+        parsed = parse_message(
+            "no-reply@us.greenhouse-mail.io",
+            "Thank you for applying to Databricks!",
+            body,
+            "msg-1",
+            "thread-databricks",
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.company, "Databricks")
+        self.assertEqual(parsed.title, "Software Engineering Intern")
+        self.assertEqual(parsed.status, OpportunityStatus.APPLIED)
+        self.assertIn("official communication from Databricks", parsed.note)
+        self.assertIn("https://mail.google.com/mail/u/0/#all/thread-databricks", parsed.note)
+
+        hint = hint_from_mail(
+            parsed.company,
+            parsed.title,
+            parsed.status,
+            parsed.note,
+            body,
+            "2026-09-24",
+            parsed.thread_id,
+        )
+        self.assertEqual(hint.tab, "internships")
+        self.assertEqual(hint.role, "Software Engineering Intern")
+        self.assertEqual(hint.date_applied, "09/24/2026")
+        self.assertEqual(hint.season, "Winter 2027")
+        self.assertEqual(hint.result, "Applied")
+        self.assertEqual(hint.location, "")
+        self.assertTrue(hint.location_missing)
+        self.assertIn("@databricks.com", hint.notes)
+        self.assertIn("thread-databricks", hint.notes)
+
     def test_merged_row_keeps_offer_and_upgrades_title(self):
         from tracker.services.gsheet import SheetHint, _merged_row
 

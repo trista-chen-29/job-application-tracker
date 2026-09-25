@@ -46,30 +46,39 @@ def result_label(status: str) -> str:
 
 INTERNSHIP_ROLE_RE = re.compile(r"\b(?:intern(?:ship)?s?|co-?ops?)\b", re.I)
 NEWGRAD_ROLE_RE = re.compile(
-    r"\b(?:new[\s-]?grads?(?:uate)?s?|university[\s-]?grads?(?:uate)?s?|early[\s-]?career|full[\s-]?time)\b",
+    r"\b(?:new[\s-]?grads?(?:uate)?s?|university[\s-]?grads?(?:uate)?s?|"
+    r"college[\s-]?grads?(?:uate)?s?|recent[\s-]?grads?(?:uate)?s?|"
+    r"early[\s-]?career|entry[\s-]?level)\b",
     re.I,
 )
-
-
 GENERIC_INTERN_TITLES = {"intern", "internship", "internships", "co-op", "coop", "co op"}
+INTERNSHIP_TAB_NAMES = ("internships", "internship")
+NEWGRAD_TAB_NAMES = ("newgrad", "newgrads", "new grades", "new grade", "new-grad", "new grad")
+
+
+def _is_specific_intern_title(title: str) -> bool:
+    text = (title or "").strip()
+    if not text or text.lower() in GENERIC_INTERN_TITLES:
+        return False
+    return bool(INTERNSHIP_ROLE_RE.search(text))
 
 
 def choose_tab(title: str, body: str = "") -> str:
     title_text = title or ""
-    if INTERNSHIP_ROLE_RE.search(title_text) and title_text.strip().lower() not in GENERIC_INTERN_TITLES:
+    if _is_specific_intern_title(title_text) and not NEWGRAD_ROLE_RE.search(title_text):
         return INTERNSHIPS_TAB
     if NEWGRAD_ROLE_RE.search(title_text):
         return NEWGRAD_TAB
-    blob = f"{title_text}\n{(body or '')[:2500]}"
-    if INTERNSHIP_ROLE_RE.search(blob) and not NEWGRAD_ROLE_RE.search(blob):
+    blob = (body or "")[:2500]
+    intern_in_body = bool(INTERNSHIP_ROLE_RE.search(blob))
+    grad_in_body = bool(NEWGRAD_ROLE_RE.search(blob)) or bool(NEWGRAD_ROLE_RE.search(title_text))
+    if intern_in_body and not grad_in_body:
         return INTERNSHIPS_TAB
-    if NEWGRAD_ROLE_RE.search(blob) and not INTERNSHIP_ROLE_RE.search(blob):
+    if grad_in_body:
         return NEWGRAD_TAB
-    if INTERNSHIP_ROLE_RE.search(blob):
+    if intern_in_body:
         return INTERNSHIPS_TAB
-    if NEWGRAD_ROLE_RE.search(blob):
-        return NEWGRAD_TAB
-    return INTERNSHIPS_TAB
+    return NEWGRAD_TAB
 
 
 def other_tab(tab: str) -> str:
@@ -77,10 +86,41 @@ def other_tab(tab: str) -> str:
 
 
 def infer_location(body: str) -> str:
-    match = re.search(r"(?:location|based in|office(?:s)? in)\s*[:\-]\s*([A-Za-z0-9 .,\-/]+)", body or "", flags=re.I)
-    if not match:
+    text = body or ""
+    match = re.search(r"(?:location|based in|office(?:s)? in|city)\s*[:\-]\s*([A-Za-z0-9 .,\-/]+)", text, flags=re.I)
+    if match:
+        return match.group(1).split("\n")[0].strip()[:80]
+    match = re.search(r"\b((?:remote|hybrid)(?:\s*/\s*(?:remote|hybrid|on-?site))?)\b", text, flags=re.I)
+    if match:
+        return match.group(1).replace("/", " / ").title()
+    match = re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*),\s*([A-Z]{2})\b", text)
+    if match:
+        return f"{match.group(1)}, {match.group(2)}"
+    return ""
+
+
+def format_applied_date(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
         return ""
-    return match.group(1).split("\n")[0].strip()[:80]
+    iso = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if iso:
+        return f"{iso.group(2)}/{iso.group(3)}/{iso.group(1)}"
+    slash = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)
+    if slash:
+        return f"{int(slash.group(1)):02d}/{int(slash.group(2)):02d}/{slash.group(3)}"
+    return text
+
+
+def date_sort_key(value: str) -> str:
+    text = str(value or "").strip()
+    iso = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if iso:
+        return iso.group(0)
+    slash = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)
+    if slash:
+        return f"{slash.group(3)}-{int(slash.group(1)):02d}-{int(slash.group(2)):02d}"
+    return text
 
 
 def normalize_company(name: str) -> str:
@@ -116,6 +156,7 @@ class SheetHint:
     notes: str
     date_applied: str
     season: str = DEFAULT_SEASON
+    location_missing: bool = False
 
 
 def header_index(headers: list[str], names: tuple[str, ...]) -> int:
@@ -166,18 +207,38 @@ def role_should_replace(current: str, nxt: str) -> bool:
         return False
     if now.lower() in {"", "intern", "internship", "role"} and new.lower() not in {"intern", "internship"}:
         return True
+    from tracker.services.mailparse import clean_role_title
+
+    if now and new and now != new and clean_role_title(now) == new:
+        return True
     return len(new) > len(now) + 6
 
 
-def hint_from_mail(company: str, title: str, status: str, note: str, body: str = "", date_applied: str = "") -> SheetHint:
+def hint_from_mail(
+    company: str,
+    title: str,
+    status: str,
+    note: str,
+    body: str = "",
+    date_applied: str = "",
+    thread_id: str = "",
+) -> SheetHint:
+    from tracker.services.mailparse import clean_role_title, infer_notes, infer_season
+
+    blob = f"{title}\n{note}\n{body}"
+    location = infer_location(body)
+    notes = infer_notes(body, thread_id) or note
+    role = clean_role_title(title) or title or "Internship"
     return SheetHint(
         company=company,
-        role=title or "Internship",
-        location=infer_location(body),
-        tab=choose_tab(title, body),
+        role=role,
+        location=location,
+        tab=choose_tab(role, blob),
         result=result_label(status),
-        notes=note,
-        date_applied=date_applied,
+        notes=notes,
+        date_applied=format_applied_date(date_applied),
+        season=infer_season(blob),
+        location_missing=not bool(location),
     )
 
 
@@ -272,7 +333,7 @@ def sort_filled_latest_first(rows: list[list[str]]) -> list[list[str]]:
     def date_key(row: list[str]) -> str:
         if date_col < 0 or date_col >= len(row):
             return ""
-        return str(row[date_col] or "")
+        return date_sort_key(str(row[date_col] or ""))
 
     filled.sort(key=date_key, reverse=True)
     return [headers] + filled + empty

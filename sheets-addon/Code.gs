@@ -7,7 +7,9 @@
 
 const CONFIG = {
   internshipsTab: 'internships',
+  internshipsAliases: ['internships', 'internship'],
   newgradTab: 'newgrad',
+  newgradAliases: ['newgrad', 'newgrads', 'new grades', 'new grade', 'new grad', 'new-grad'],
   logTab: '_gmail_log',
   defaultSeason: 'Summer 2027',
   lookbackDays: 730,
@@ -49,6 +51,7 @@ function recheckScraped() {
   let created = 0;
   let updated = 0;
   let skipped = 0;
+  const missingLocations = [];
   batch.forEach((id) => {
     let message;
     try {
@@ -57,12 +60,13 @@ function recheckScraped() {
       skipped += 1;
       return;
     }
-    const hint = parseMessage(message.getFrom(), message.getSubject(), fullMessageBody(message), message.getDate());
+    const hint = parseMessage(message);
     if (!hint) {
       skipped += 1;
       return;
     }
     const result = applyHint(hint);
+    if (hint.locationMissing && (result === 'created' || result === 'updated')) missingLocations.push(hint.company);
     if (result === 'created') created += 1;
     else if (result === 'updated') updated += 1;
     else skipped += 1;
@@ -71,11 +75,13 @@ function recheckScraped() {
   sortNewestAppliedFirst(CONFIG.internshipsTab);
   sortNewestAppliedFirst(CONFIG.newgradTab);
   const left = ids.length - (start + batch.length);
-  SpreadsheetApp.getActive().toast(
-    'Rechecked ' + batch.length + ': added ' + created + ', updated ' + updated + ', skipped ' + skipped +
-      (left > 0 ? '. Run Recheck again for ' + left + ' more.' : '. Done with scraped mail.'),
+  finishToast(
     'Tracker',
-    10
+    created,
+    updated,
+    skipped,
+    missingLocations,
+    left > 0 ? '. Run Recheck again for ' + left + ' more.' : '. Done with scraped mail.'
   );
 }
 
@@ -93,6 +99,7 @@ function syncGmail() {
   let created = 0;
   let updated = 0;
   let skipped = 0;
+  const missingLocations = [];
 
   threads.forEach((thread) => {
     thread.getMessages().forEach((message) => {
@@ -101,12 +108,7 @@ function syncGmail() {
         skipped += 1;
         return;
       }
-      const hint = parseMessage(
-        message.getFrom(),
-        message.getSubject(),
-        fullMessageBody(message),
-        message.getDate()
-      );
+      const hint = parseMessage(message);
       markProcessed(id, message.getSubject());
       seen[id] = true;
       if (!hint) {
@@ -114,6 +116,7 @@ function syncGmail() {
         return;
       }
       const result = applyHint(hint);
+      if (hint.locationMissing && (result === 'created' || result === 'updated')) missingLocations.push(hint.company);
       if (result === 'created') created += 1;
       else if (result === 'updated') updated += 1;
       else skipped += 1;
@@ -122,12 +125,7 @@ function syncGmail() {
 
   sortNewestAppliedFirst(CONFIG.internshipsTab);
   sortNewestAppliedFirst(CONFIG.newgradTab);
-
-  SpreadsheetApp.getActive().toast(
-    'Added ' + created + ', updated ' + updated + ', skipped ' + skipped,
-    'Gmail sync',
-    8
-  );
+  finishToast('Gmail sync', created, updated, skipped, missingLocations, '');
 }
 
 function fullMessageBody(message) {
@@ -151,21 +149,28 @@ function htmlToText(html) {
     .trim();
 }
 
-function parseMessage(fromHeader, subject, body, date) {
+function parseMessage(message) {
+  const fromHeader = message.getFrom();
+  const subject = message.getSubject();
+  const body = fullMessageBody(message);
+  const date = message.getDate();
   const text = (subject + '\n' + body).toLowerCase();
   const status = inferStatus(text);
   const company = inferCompany(fromHeader, subject, body);
   if (!status || !company) return null;
-    const role = inferTitle(subject, body);
+  const role = cleanRoleTitle(inferTitle(subject, body));
+  const location = inferLocation(body);
+  const blob = subject + '\n' + body;
   return {
     company: company.slice(0, 200),
     role: role,
-    location: inferLocation(body),
-    tab: chooseTab(role, subject + '\n' + body),
+    location: location,
+    locationMissing: !location,
+    tab: chooseTab(role, blob),
     result: status,
-    notes: 'From email: ' + String(subject || '').slice(0, 180),
+    notes: inferNotes(body, message),
     dateApplied: formatDate(date),
-    season: CONFIG.defaultSeason,
+    season: inferSeason(blob),
   };
 }
 
@@ -247,6 +252,7 @@ function cleanCompany(name) {
     .replace(/(recruiting|careers|talent acquisition team|talent acquisition|university|noreply|no-reply|do not reply)/gi, '')
     .replace(/[-|]+/g, ' ')
     .replace(/\s+/g, ' ')
+    .replace(/[!?.,]+$/g, '')
     .trim();
   const junk = ['jobs', 'careers', 'recruiting', 'talent', 'no reply', 'noreply', ''];
   if (!text || text.length > 80 || text.indexOf('@') >= 0 || junk.indexOf(text.toLowerCase()) >= 0) return '';
@@ -256,40 +262,106 @@ function cleanCompany(name) {
 function inferTitle(subject, body) {
   const blob = subject + '\n' + String(body || '').slice(0, 4000);
   const patterns = [
-    /(?:the\s+)?(?:position|role)\s+of\s+([^.\n]+)/i,
+    /(?:the\s+)?(?:position|role)\s+of\s+([^.\n]+?)(?:\s+has been|$|\.)/i,
+    /application for(?: the)?(?: position of| role of)?\s+(.+?)\s+role\b/i,
     /application for(?: the)?(?: position of| role of)?\s+([^.\n]+)/i,
     /for the\s+([^.\n]*?(?:intern(?:ship)?|co-?op|new grad)[^.\n]*)/i,
   ];
   for (let i = 0; i < patterns.length; i += 1) {
     const match = blob.match(patterns[i]);
     if (!match) continue;
-    let title = match[1].replace(/\s+/g, ' ').replace(/^(?:the|a|an)\s+/i, '').replace(/\s+role$/i, '').trim();
+    const title = cleanRoleTitle(match[1]);
     if (title.length >= 4) return title.slice(0, 200);
   }
-  return 'Internship';
+  if (isNewGradRole(blob)) return 'New Grad';
+  if (isInternRole(blob)) return 'Internship';
+  return 'Role';
+}
+
+function cleanRoleTitle(title) {
+  let text = String(title || '')
+    .replace(/\s+/g, ' ')
+    .replace(/^(?:the|a|an)\s+/i, '')
+    .replace(/\s+role$/i, '')
+    .trim();
+  text = text.replace(/\s*[\(\[][^)\]]*(?:20\d{2}|start|summer|winter|fall|spring)[^)\]]*[\)\]]/gi, '');
+  text = text.replace(/\s*[-–—,]\s*(?:summer|winter|fall|autumn|spring)(?:\s+20\d{2})?\s*$/i, '');
+  text = text.replace(/\s+has been received.*$/i, '');
+  return text.replace(/\s+/g, ' ').replace(/^[-–—, ]+|[-–—, ]+$/g, '').slice(0, 200);
+}
+
+function inferSeason(text) {
+  const blob = String(text || '');
+  let match = blob.match(/\b(summer|winter|fall|autumn|spring)\s+(20\d{2})\b/i);
+  if (match) return seasonName(match[1]) + ' ' + match[2];
+  const yearMatch = blob.match(/\b(20\d{2})\s+start\b/i);
+  const seasonMatch = blob.match(/\b(summer|winter|fall|autumn|spring)\b/i);
+  if (seasonMatch) return seasonName(seasonMatch[1]) + ' ' + (yearMatch ? yearMatch[1] : '2027');
+  if (yearMatch) return 'Summer ' + yearMatch[1];
+  return CONFIG.defaultSeason;
+}
+
+function seasonName(name) {
+  const text = String(name || '').toLowerCase();
+  if (text === 'autumn') return 'Fall';
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function inferNotes(body, message) {
+  const parts = [];
+  const note = extractPleaseNote(body);
+  if (note) parts.push(note);
+  if (message) {
+    try {
+      parts.push('https://mail.google.com/mail/u/0/#all/' + message.getThread().getId());
+    } catch (err) {
+      // ignore missing thread id
+    }
+  }
+  return parts.join('\n');
+}
+
+function extractPleaseNote(body) {
+  const text = String(body || '');
+  const match = text.match(
+    /please note(?: that)?[:\s]+([\s\S]+?)(?:\n\s*\n|\n\s*regards|\n\s*\*\*\s*please note:\s*do not reply|$)/i
+  );
+  if (match) {
+    let note = String(match[0] || '')
+      .replace(/\s+/g, ' ')
+      .replace(/\s*\*+\s*please note:.*$/i, '')
+      .trim();
+    if (/official communication|email addresses ending/i.test(note) || !/do not reply/i.test(note)) {
+      return note.slice(0, 500);
+    }
+  }
+  const official = text.match(/[^.]*official communication[^.]*\./i);
+  return official ? official[0].trim().slice(0, 500) : '';
 }
 
 function inferLocation(body) {
-  const match = String(body || '').match(
-    /(?:location|based in|office(?:s)? in)\s*[:\-]\s*([A-Za-z0-9 .,\-/]+)/i
-  );
-  if (!match) return '';
-  return match[1].split('\n')[0].trim().slice(0, 80);
+  const text = String(body || '');
+  let match = text.match(/(?:location|based in|office(?:s)? in|city)\s*[:\-]\s*([A-Za-z0-9 .,\-/]+)/i);
+  if (match) return match[1].split('\n')[0].trim().slice(0, 80);
+  match = text.match(/\b((?:remote|hybrid)(?:\s*\/\s*(?:remote|hybrid|on-?site))?)\b/i);
+  if (match) return match[1];
+  match = text.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*),\s*([A-Z]{2})\b/);
+  if (match) return match[1] + ', ' + match[2];
+  return '';
 }
 
 function chooseTab(title, body) {
   const role = String(title || '').trim();
   const genericIntern = /^(intern(?:ship)?s?|co-?ops?)$/i.test(role);
-  if (isInternRole(role) && !genericIntern) return CONFIG.internshipsTab;
+  if (isInternRole(role) && !genericIntern && !isNewGradRole(role)) return CONFIG.internshipsTab;
   if (isNewGradRole(role)) return CONFIG.newgradTab;
-  const blob = role + '\n' + String(body || '').slice(0, 2500);
+  const blob = String(body || '').slice(0, 2500);
   const intern = isInternRole(blob);
-  const grad = isNewGradRole(blob);
+  const grad = isNewGradRole(blob) || isNewGradRole(role);
   if (intern && !grad) return CONFIG.internshipsTab;
-  if (grad && !intern) return CONFIG.newgradTab;
-  if (intern) return CONFIG.internshipsTab;
   if (grad) return CONFIG.newgradTab;
-  return CONFIG.internshipsTab;
+  if (intern) return CONFIG.internshipsTab;
+  return CONFIG.newgradTab;
 }
 
 function isInternRole(text) {
@@ -297,17 +369,39 @@ function isInternRole(text) {
 }
 
 function isNewGradRole(text) {
-  return /\b(?:new[\s-]?grads?(?:uate)?s?|university[\s-]?grads?(?:uate)?s?|early[\s-]?career|full[\s-]?time)\b/i.test(
+  return /\b(?:new[\s-]?grads?(?:uate)?s?|university[\s-]?grads?(?:uate)?s?|college[\s-]?grads?(?:uate)?s?|recent[\s-]?grads?(?:uate)?s?|early[\s-]?career|entry[\s-]?level)\b/i.test(
     String(text || '')
   );
 }
 
+function sheetForTab(tab) {
+  const compact = String(tab || '').toLowerCase().replace(/\s+/g, '');
+  const internWanted = CONFIG.internshipsAliases.map((name) => name.toLowerCase().replace(/\s+/g, ''));
+  if (internWanted.indexOf(compact) >= 0) return findNamedSheet(CONFIG.internshipsAliases);
+  return findNamedSheet(CONFIG.newgradAliases);
+}
+
+function findNamedSheet(aliases) {
+  const sheets = SpreadsheetApp.getActive().getSheets();
+  const wanted = aliases.map((name) => String(name).toLowerCase().replace(/\s+/g, ''));
+  for (let i = 0; i < sheets.length; i += 1) {
+    const compact = sheets[i].getName().toLowerCase().replace(/\s+/g, '');
+    if (wanted.indexOf(compact) >= 0) return sheets[i];
+  }
+  return SpreadsheetApp.getActive().getSheetByName(aliases[0]);
+}
+
 function otherTab(tab) {
-  return tab === CONFIG.internshipsTab ? CONFIG.newgradTab : CONFIG.internshipsTab;
+  const internSheet = findNamedSheet(CONFIG.internshipsAliases);
+  const gradSheet = findNamedSheet(CONFIG.newgradAliases);
+  const compact = String(tab || '').toLowerCase().replace(/\s+/g, '');
+  const internWanted = CONFIG.internshipsAliases.map((name) => name.toLowerCase().replace(/\s+/g, ''));
+  if (internWanted.indexOf(compact) >= 0) return gradSheet ? gradSheet.getName() : CONFIG.newgradTab;
+  return internSheet ? internSheet.getName() : CONFIG.internshipsTab;
 }
 
 function applyHint(hint) {
-  const intended = SpreadsheetApp.getActive().getSheetByName(hint.tab);
+  const intended = sheetForTab(hint.tab);
   if (!intended) return 'skipped';
   const cols = headerMap(intended);
   if (cols.company < 0 || cols.result < 0) return 'skipped';
@@ -317,7 +411,7 @@ function applyHint(hint) {
   let values = sheet.getRange(1, 1, last, width).getDisplayValues();
   let matchRow = findCompanyRow(values, cols.company, hint.company);
   if (matchRow <= 0) {
-    const alt = SpreadsheetApp.getActive().getSheetByName(otherTab(hint.tab));
+    const alt = sheetForTab(otherTab(hint.tab));
     if (alt) {
       const altCols = headerMap(alt);
       const altLast = Math.max(alt.getLastRow(), 2);
@@ -329,9 +423,10 @@ function applyHint(hint) {
         writeCell(sheet, 2, cols.date, hint.dateApplied || (altCols.date >= 0 ? altValues[altRow - 1][altCols.date] : ''));
         writeCell(sheet, 2, cols.company, hint.company);
         writeCell(sheet, 2, cols.role, hint.role || (altCols.role >= 0 ? altValues[altRow - 1][altCols.role] : ''));
-        if (cols.location >= 0) writeCell(sheet, 2, cols.location, hint.location || '');
+        writeLocation(sheet, 2, cols.location, hint.location || (altCols.location >= 0 ? altValues[altRow - 1][altCols.location] : ''), hint.locationMissing);
         if (cols.season >= 0) writeCell(sheet, 2, cols.season, hint.season || CONFIG.defaultSeason);
         writeCell(sheet, 2, cols.result, hint.result || (altCols.result >= 0 ? altValues[altRow - 1][altCols.result] : 'Applied'));
+        if (cols.notes >= 0) writeCell(sheet, 2, cols.notes, hint.notes);
         if (altCols.company >= 0) alt.getRange(altRow, altCols.company + 1).setValue('');
         if (altCols.role >= 0) alt.getRange(altRow, altCols.role + 1).setValue('');
         return 'updated';
@@ -350,6 +445,23 @@ function applyHint(hint) {
       writeCell(sheet, matchRow, cols.role, hint.role);
       changed = true;
     }
+    if (cols.season >= 0 && hint.season) {
+      const currentSeason = String(values[matchRow - 1][cols.season] || '');
+      if (!currentSeason || (currentSeason === CONFIG.defaultSeason && hint.season !== currentSeason)) {
+        writeCell(sheet, matchRow, cols.season, hint.season);
+        changed = true;
+      }
+    }
+    if (cols.location >= 0) {
+      const currentLoc = String(values[matchRow - 1][cols.location] || '');
+      if (!currentLoc) {
+        writeLocation(sheet, matchRow, cols.location, hint.location, hint.locationMissing);
+        changed = true;
+      } else if (hint.location && !currentLoc) {
+        writeLocation(sheet, matchRow, cols.location, hint.location, false);
+        changed = true;
+      }
+    }
     if (cols.notes >= 0 && hint.notes) {
       const existing = String(values[matchRow - 1][cols.notes] || '');
       if (existing.indexOf(hint.notes) === -1) {
@@ -364,7 +476,7 @@ function applyHint(hint) {
   writeCell(sheet, emptyRow, cols.date, hint.dateApplied);
   writeCell(sheet, emptyRow, cols.company, hint.company);
   writeCell(sheet, emptyRow, cols.role, hint.role);
-  if (cols.location >= 0 && hint.location) writeCell(sheet, emptyRow, cols.location, hint.location);
+  writeLocation(sheet, emptyRow, cols.location, hint.location, hint.locationMissing);
   if (cols.season >= 0) writeCell(sheet, emptyRow, cols.season, hint.season || CONFIG.defaultSeason);
   writeCell(sheet, emptyRow, cols.result, hint.result);
   if (cols.notes >= 0) writeCell(sheet, emptyRow, cols.notes, hint.notes);
@@ -372,7 +484,7 @@ function applyHint(hint) {
 }
 
 function sortNewestAppliedFirst(tabName) {
-  const sheet = SpreadsheetApp.getActive().getSheetByName(tabName);
+  const sheet = sheetForTab(tabName);
   if (!sheet) return;
   const cols = headerMap(sheet);
   if (cols.company < 0) return;
@@ -446,16 +558,40 @@ function shouldAdvance(current, next) {
 }
 
 function roleShouldReplace(current, next) {
-  const now = String(current || '').trim().toLowerCase();
+  const now = String(current || '').trim();
   const nxt = String(next || '').trim();
   if (!nxt) return false;
-  if ((now === '' || now === 'intern' || now === 'internship' || now === 'role') && nxt.toLowerCase() !== 'intern') return true;
-  return nxt.length > String(current || '').length + 6;
+  const lower = now.toLowerCase();
+  if ((lower === '' || lower === 'intern' || lower === 'internship' || lower === 'role') && nxt.toLowerCase() !== 'intern') return true;
+  if (now && nxt && now !== nxt && cleanRoleTitle(now) === nxt) return true;
+  return nxt.length > now.length + 6;
 }
 
 function writeCell(sheet, row, colIndex, value) {
   if (colIndex < 0 || !value) return;
   sheet.getRange(row, colIndex + 1).setValue(value);
+}
+
+function writeLocation(sheet, row, colIndex, location, missing) {
+  if (colIndex < 0) return;
+  const cell = sheet.getRange(row, colIndex + 1);
+  if (location) cell.setValue(location);
+  if (missing && !String(location || '').trim()) {
+    cell.setBackground('#ffd000');
+  } else if (location) {
+    cell.setBackground(null);
+  }
+}
+
+function finishToast(title, created, updated, skipped, missingCompanies, extra) {
+  let text = 'Added ' + created + ', updated ' + updated + ', skipped ' + skipped;
+  if (extra) text += extra;
+  if (missingCompanies && missingCompanies.length) {
+    const unique = missingCompanies.filter((name, index) => missingCompanies.indexOf(name) === index);
+    text += '. Location missing (yellow): ' + unique.slice(0, 6).join(', ');
+    if (unique.length > 6) text += ' +' + (unique.length - 6);
+  }
+  SpreadsheetApp.getActive().toast(text, title, 12);
 }
 
 function normalizeCompany(name) {
@@ -477,7 +613,7 @@ function containsAny(blob, phrases) {
 
 function formatDate(date) {
   if (!date) return '';
-  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'MM/dd/yyyy');
 }
 
 function loadProcessedIds() {
