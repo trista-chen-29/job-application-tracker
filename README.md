@@ -23,6 +23,7 @@ The live tracker is the spreadsheet plugin.
 - A message ID in the log is not a permanent skip. Failed writes stay `failed` and are retried. Ignored mail (no company/status) is stored separately from failures.
 - Paste the latest [`sheets-addon/Code.gs`](sheets-addon/Code.gs) after pulling parser changes. The current parser version is **10**.
 - **Sync Gmail now** walks every matching thread (not just the newest 50), oldest first, and stops before the 6-minute Apps Script limit. Auto-sync (every 10 minutes) picks up anything left, then only scans the last 7 days.
+- Rows are kept in **Date Applied** order, earliest first, after every sync. Rows without a date go after dated rows. **Tracker → Sort by Date Applied** re-sorts on demand.
 - Date Applied comes only from the confirmation email. Follow-up mail without a role (OA, rejection) updates the row in whatever tab it is already in.
 - Blank Role cells are highlighted light blue and blank Location cells yellow. Your own replies, job alerts, and anything in `CONFIG.ignoreCompanies` are skipped.
 - The Django app uses a Python port of the same extraction ([`tracker/services/extract.py`](tracker/services/extract.py)); keep the two in step when changing either.

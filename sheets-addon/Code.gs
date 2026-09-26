@@ -94,6 +94,7 @@ function addTrackerMenu() {
     .addItem('Sync Gmail now', 'syncGmail')
     .addItem('Recheck scraped mail', 'recheckScraped')
     .addItem('Reprocess all stale mail', 'reprocessAllStale')
+    .addItem('Sort by Date Applied', 'sortByDateApplied')
     .addSeparator()
     .addItem('Turn on auto-sync', 'installAutoSync')
     .addItem('Turn off auto-sync', 'stopAutoSync')
@@ -179,6 +180,7 @@ function runRecheck() {
   if (start >= stale.length) start = 0;
   const batch = stale.slice(start, start + CONFIG.recheckBatch);
   const counts = processMessageRecords(batch, log, Date.now() + CONFIG.runBudgetMs);
+  sortTrackerTabs();
   const attempted = batch.slice(0, batch.length - counts.remaining);
   const stillStale = attempted.filter((record) => shouldReprocess(log.byId[record.message_id])).length;
   // Messages that are now current drop out of the stale list, so only step past the ones still stale.
@@ -247,6 +249,7 @@ function runGmailSync() {
   // Oldest first, so the confirmation creates the row before later OA / rejection mail updates it.
   records.sort((a, b) => a._time - b._time);
   const counts = processMessageRecords(records, log, started + CONFIG.runBudgetMs);
+  sortTrackerTabs();
   let extra = '';
   if (counts.remaining) {
     props.deleteProperty('syncCaughtUp');
@@ -1079,6 +1082,76 @@ function firstEmptyCompanyRow(values, companyCol) {
     if (!String(values[i][companyCol] || '').trim()) return i + 1;
   }
   return values.length + 1;
+}
+
+function sortByDateApplied() {
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(1000)) {
+    notify('A Gmail sync is running. Try again in a minute.', 'Tracker');
+    return;
+  }
+  try {
+    const moved = sortTrackerTabs();
+    notify(moved ? 'Rows sorted from earliest to latest Date Applied.' : 'Rows are already in Date Applied order.', 'Tracker');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function sortTrackerTabs() {
+  let moved = false;
+  [findNamedSheet(CONFIG.internshipsAliases), findNamedSheet(CONFIG.newgradAliases)].forEach((sheet) => {
+    if (!sheet) return;
+    try {
+      if (sortSheetByDate(sheet)) moved = true;
+    } catch (err) {
+      notify('Could not sort ' + sheet.getName() + ': ' + err, 'Tracker');
+    }
+  });
+  return moved;
+}
+
+// Earliest Date Applied first; rows without a date follow in their current order; blank rows stay at the bottom.
+function sortSheetByDate(sheet) {
+  const cols = headerMap(sheet);
+  const last = sheet.getLastRow();
+  if (cols.company < 0 || cols.date < 0 || last < 3) return false;
+  const width = sheet.getLastColumn();
+  const values = sheet.getRange(2, 1, last - 1, width).getValues();
+  const order = values
+    .map((row, i) => {
+      const filled = String(row[cols.company] || '').trim() !== '';
+      const time = filled ? dateSortValue(row[cols.date]) : null;
+      return { i: i, tier: !filled ? 2 : time === null ? 1 : 0, time: time || 0 };
+    })
+    .sort((a, b) => a.tier - b.tier || a.time - b.time || a.i - b.i);
+  if (order.every((item, pos) => item.i === pos)) return false;
+  const rank = [];
+  order.forEach((item, pos) => {
+    rank[item.i] = [pos];
+  });
+  // Range.sort moves each row's highlights and dropdowns with it; a temporary key column controls the order.
+  const keyCol = width + 1;
+  sheet.insertColumnAfter(width);
+  try {
+    sheet.getRange(2, keyCol, rank.length, 1).setValues(rank);
+    sheet.getRange(2, 1, rank.length, keyCol).sort({ column: keyCol, ascending: true });
+  } finally {
+    sheet.deleteColumn(keyCol);
+  }
+  return true;
+}
+
+function dateSortValue(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    return isNaN(value.getTime()) ? null : value.getTime();
+  }
+  const text = String(value || '').trim();
+  let m = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/);
+  if (m) return new Date(m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]), Number(m[1]) - 1, Number(m[2])).getTime();
+  m = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime();
+  return null;
 }
 
 function shouldAdvance(current, next) {

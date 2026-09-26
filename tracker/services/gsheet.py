@@ -440,28 +440,30 @@ def _merged_row(headers: list[str], hint: SheetHint, existing: list[str] | None,
     return row
 
 
-def sort_filled_latest_first(rows: list[list[str]]) -> list[list[str]]:
+def sort_filled_earliest_first(rows: list[list[str]]) -> list[list[str]]:
+    """Same order as sortSheetByDate in Code.gs: dated rows oldest first, then undated rows, then blank rows."""
     if len(rows) < 2:
         return rows
     headers = rows[0]
     company_col = header_index(headers, ("company",))
     date_col = header_index(headers, ("date applied", "applied", "date"))
-    filled: list[list[str]] = []
+    if company_col < 0 or date_col < 0:
+        return rows
+    dated: list[tuple[str, list[str]]] = []
+    undated: list[list[str]] = []
     empty: list[list[str]] = []
     for row in rows[1:]:
-        company = row[company_col] if company_col >= 0 and company_col < len(row) else ""
-        if str(company).strip():
-            filled.append(row)
-        else:
+        company = row[company_col] if company_col < len(row) else ""
+        if not str(company).strip():
             empty.append(row)
-
-    def date_key(row: list[str]) -> str:
-        if date_col < 0 or date_col >= len(row):
-            return ""
-        return date_sort_key(str(row[date_col] or ""))
-
-    filled.sort(key=date_key, reverse=True)
-    return [headers] + filled + empty
+            continue
+        key = date_sort_key(str(row[date_col] if date_col < len(row) else ""))
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", key):
+            dated.append((key, row))
+        else:
+            undated.append(row)
+    dated.sort(key=lambda item: item[0])
+    return [headers] + [row for _, row in dated] + undated + empty
 
 
 def _blank_identity_row(headers: list[str], existing: list[str]) -> list[str]:
@@ -533,7 +535,7 @@ def push_hints(creds, spreadsheet_id: str, hints: list[SheetHint]) -> dict:
         if result.get("from_tab"):
             dirty_tabs.add(result["from_tab"])
     for tab in dirty_tabs:
-        grid = grids[tab]
+        grid = sort_filled_earliest_first(grids[tab])
         last_col = _col_letter(max(len(grid[0]) - 1, 0))
         writes.append({"range": f"'{tab}'!A1:{last_col}{len(grid)}", "values": grid})
     if writes:

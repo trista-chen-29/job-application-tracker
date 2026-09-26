@@ -580,19 +580,19 @@ class GoogleSheetFillTests(TestCase):
         self.assertEqual(plan["action"], "create")
         self.assertEqual(plan["row"], 2)
 
-    def test_newest_applied_rows_sort_to_the_top(self):
-        from tracker.services.gsheet import sort_filled_latest_first
+    def test_earliest_applied_rows_sort_to_the_top(self):
+        from tracker.services.gsheet import sort_filled_earliest_first
 
         rows = [
             ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
-            ["2026-01-01", "OldCo", "Intern", "", "Summer 2027", "Applied", ""],
-            ["2026-09-24", "Graphcore", "Firmware Engineering Intern", "", "Summer 2027", "Applied", ""],
-            ["", "", "", "", "Summer 2027", "Applied", ""],
+            ["09/24/2026", "Graphcore", "Firmware Engineering Intern", "", "Summer 2027", "Applied", ""],
+            ["", "NoDateCo", "Intern", "", "", "Rejected", ""],
+            ["", "", "", "", "Summer 2027", "", ""],
+            ["1/5/2026", "OldCo", "Intern", "", "Summer 2027", "Applied", ""],
+            ["2026-03-10", "MidCo", "Intern", "", "", "Applied", ""],
         ]
-        sorted_rows = sort_filled_latest_first(rows)
-        self.assertEqual(sorted_rows[1][1], "Graphcore")
-        self.assertEqual(sorted_rows[2][1], "OldCo")
-        self.assertEqual(sorted_rows[3][1], "")
+        sorted_rows = sort_filled_earliest_first(rows)
+        self.assertEqual([row[1] for row in sorted_rows[1:]], ["OldCo", "MidCo", "Graphcore", "NoDateCo", ""])
 
     def test_new_grad_goes_to_newgrad_tab(self):
         from tracker.constants import OpportunityStatus
