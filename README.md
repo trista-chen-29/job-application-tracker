@@ -9,7 +9,31 @@ The live tracker is the spreadsheet, not the Django site. Tabs:
 | `internships` | Date Applied, Company, Role, Location, Season, Result, Notes |
 | `newgrad` | Date Applied, Company, Role, Location, Result, Notes |
 
-Default season for internships is **Summer 2027**. New-grad mail goes to `newgrad`.
+Result values: Applied, Rejected, OA, Interview, Offer. Season values: Winter 2027, Spring 2027, Summer 2027.
+
+Season is **not invented**. It is filled only when the email names one of the three dropdown values; anything else (Fall 2027, Summer 2026, a bare "summer") leaves Season blank or keeps what you typed.
+
+## Sync and recheck
+
+The live tracker is the spreadsheet plugin.
+
+- **Tracker → Sync Gmail now** reads new recruiter mail and also retries log rows whose parser version is old, whose status is `failed`/`review`, or that never finished applying.
+- Matching is **company + role**. Two roles at the same company stay two rows. Confirmation mail fills missing date/role/location/season/notes without wiping later Result values (OA / Interview / Offer).
+- **Tracker → Recheck scraped mail** walks stale `_gmail_log` rows in batches of 30. **Reprocess all stale mail** restarts that walk.
+- A message ID in the log is not a permanent skip. Failed writes stay `failed` and are retried. Ignored mail (no company/status) is stored separately from failures.
+- Paste the latest [`sheets-addon/Code.gs`](sheets-addon/Code.gs) after pulling parser changes. The current parser version is **10**.
+- **Sync Gmail now** walks every matching thread (not just the newest 50), oldest first, and stops before the 6-minute Apps Script limit. Auto-sync (every 10 minutes) picks up anything left, then only scans the last 7 days.
+- Date Applied comes only from the confirmation email. Follow-up mail without a role (OA, rejection) updates the row in whatever tab it is already in.
+- Blank Role cells are highlighted light blue and blank Location cells yellow. Your own replies, job alerts, and anything in `CONFIG.ignoreCompanies` are skipped.
+- The Django app uses a Python port of the same extraction ([`tracker/services/extract.py`](tracker/services/extract.py)); keep the two in step when changing either.
+- If the **Tracker** menu does not appear after a reload, pick `installTracker` in the Apps Script editor's function dropdown and click **Run** once. It adds an open trigger for the menu and turns on auto-sync. Also make sure `appsscript.json` includes the `script.container.ui` scope; without it Google blocks the menu.
+
+## Switching to a new spreadsheet
+
+1. In the new spreadsheet, create tabs `internships` and `newgrad` with the headers above. Pre-filled Season/Result dropdowns are fine.
+2. Open **Extensions → Apps Script** *in the new spreadsheet* (the script is bound to one sheet) and paste `Code.gs` + `appsscript.json`. Save and reload.
+3. **Tracker → Sync Gmail now**, then **Tracker → Recheck scraped mail** until it reports nothing left. The new sheet gets its own empty `_gmail_log`, so every email is processed again.
+4. Local Django app only: paste the new sheet URL on the Gmail page. Saving a different sheet marks logged mail as stale so the next sync writes it to the new sheet.
 
 ## Sheet plugin (use this)
 
@@ -21,7 +45,7 @@ Runs inside Google Sheets. No server, no deploy.
 4. In **Project Settings**, enable `appsscript.json` and replace it with [`sheets-addon/appsscript.json`](sheets-addon/appsscript.json).
 5. Save, return to the sheet, reload.
 6. Menu **Tracker → Sync Gmail now**. Approve Gmail (read) and this spreadsheet.
-7. **Tracker → Install hourly sync**.
+7. Done. The first sync turns on auto-sync, which checks Gmail every 10 minutes even with the sheet closed (**Tracker → Turn off auto-sync** to stop).
 
 Details and behavior notes: [`sheets-addon/README.md`](sheets-addon/README.md).
 

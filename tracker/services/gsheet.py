@@ -4,10 +4,10 @@ import re
 from dataclasses import dataclass
 
 from tracker.constants import OpportunityStatus, SHEET_STATUS_RANK
+from tracker.services import extract
+from tracker.services.extract import GENERIC_ROLES, INTERNSHIPS_TAB, NEWGRAD_TAB, PLATFORM_COMPANIES  # noqa: F401
 
-INTERNSHIPS_TAB = "internships"
-NEWGRAD_TAB = "newgrad"
-DEFAULT_SEASON = "Summer 2027"
+DEFAULT_SEASON = ""
 
 RESULT_LABEL = {
     OpportunityStatus.APPLIED: "Applied",
@@ -44,59 +44,17 @@ def result_label(status: str) -> str:
     return RESULT_LABEL.get(status, "Applied")
 
 
-INTERNSHIP_ROLE_RE = re.compile(r"\b(?:intern(?:ship)?s?|co-?ops?)\b", re.I)
-NEWGRAD_ROLE_RE = re.compile(
-    r"\b(?:new[\s-]?grads?(?:uate)?s?|university[\s-]?grads?(?:uate)?s?|"
-    r"college[\s-]?grads?(?:uate)?s?|recent[\s-]?grads?(?:uate)?s?|"
-    r"early[\s-]?career|entry[\s-]?level)\b",
-    re.I,
-)
-GENERIC_INTERN_TITLES = {"intern", "internship", "internships", "co-op", "coop", "co op"}
-INTERNSHIP_TAB_NAMES = ("internships", "internship")
-NEWGRAD_TAB_NAMES = ("newgrad", "newgrads", "new grades", "new grade", "new-grad", "new grad")
-
-
-def _is_specific_intern_title(title: str) -> bool:
-    text = (title or "").strip()
-    if not text or text.lower() in GENERIC_INTERN_TITLES:
-        return False
-    return bool(INTERNSHIP_ROLE_RE.search(text))
-
-
-def choose_tab(title: str, body: str = "") -> str:
-    title_text = title or ""
-    if _is_specific_intern_title(title_text) and not NEWGRAD_ROLE_RE.search(title_text):
-        return INTERNSHIPS_TAB
-    if NEWGRAD_ROLE_RE.search(title_text):
-        return NEWGRAD_TAB
-    blob = (body or "")[:2500]
-    intern_in_body = bool(INTERNSHIP_ROLE_RE.search(blob))
-    grad_in_body = bool(NEWGRAD_ROLE_RE.search(blob)) or bool(NEWGRAD_ROLE_RE.search(title_text))
-    if intern_in_body and not grad_in_body:
-        return INTERNSHIPS_TAB
-    if grad_in_body:
-        return NEWGRAD_TAB
-    if intern_in_body:
-        return INTERNSHIPS_TAB
-    return NEWGRAD_TAB
+choose_tab = extract.choose_tab
+tab_from_role = extract.tab_from_role
+infer_location = extract.infer_location
 
 
 def other_tab(tab: str) -> str:
     return NEWGRAD_TAB if tab == INTERNSHIPS_TAB else INTERNSHIPS_TAB
 
 
-def infer_location(body: str) -> str:
-    text = body or ""
-    match = re.search(r"(?:location|based in|office(?:s)? in|city)\s*[:\-]\s*([A-Za-z0-9 .,\-/]+)", text, flags=re.I)
-    if match:
-        return match.group(1).split("\n")[0].strip()[:80]
-    match = re.search(r"\b((?:remote|hybrid)(?:\s*/\s*(?:remote|hybrid|on-?site))?)\b", text, flags=re.I)
-    if match:
-        return match.group(1).replace("/", " / ").title()
-    match = re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*),\s*([A-Z]{2})\b", text)
-    if match:
-        return f"{match.group(1)}, {match.group(2)}"
-    return ""
+def location_should_highlight(location: str, location_missing: bool) -> bool:
+    return bool(location_missing) and not str(location or "").strip()
 
 
 def format_applied_date(value: str) -> str:
@@ -133,7 +91,13 @@ def normalize_company(name: str) -> str:
 
 
 def should_advance(current: str, nxt: str) -> bool:
+    if not nxt:
+        return False
+    if current == nxt:
+        return False
     if current == "Offer" and nxt == "Rejected":
+        return False
+    if nxt == "Applied" and current and current != "Applied":
         return False
     if nxt == "Offer" and current == "Rejected":
         return True
@@ -155,8 +119,11 @@ class SheetHint:
     result: str
     notes: str
     date_applied: str
-    season: str = DEFAULT_SEASON
+    season: str = ""
     location_missing: bool = False
+    source_url: str = ""
+    useful_note: str = ""
+    application_key: str = ""
 
 
 def header_index(headers: list[str], names: tuple[str, ...]) -> int:
@@ -175,29 +142,80 @@ def first_empty_company_row(rows: list[list[str]], company_col: int) -> int:
     return len(rows) + 1
 
 
-def _role_tokens(role: str) -> set[str]:
-    stop = {"the", "a", "an", "of", "and", "for", "role", "position"}
-    return {part for part in normalize_company(role).split() if part and part not in stop}
+def is_generic_role(role: str) -> bool:
+    return normalize_company(role) in GENERIC_ROLES
+
+
+def is_placeholder(value: str) -> bool:
+    text = (value or "").strip()
+    if not text:
+        return True
+    if text.lower().startswith("review"):
+        return True
+    return is_generic_role(text)
+
+
+def application_key(company: str, role: str, season: str = "") -> str:
+    return "|".join([normalize_company(company), normalize_company(role), normalize_company(season)])
 
 
 def find_company_row(rows: list[list[str]], company_col: int, company: str, role: str = "", role_col: int = -1) -> int:
-    target = normalize_company(company)
-    if not target:
-        return 0
-    hits: list[int] = []
+    match = resolve_row_match(rows, company, role)
+    if match["action"] == "update":
+        return match["row"]
+    return 0
+
+
+def resolve_row_match(rows: list[list[str]], company: str, role: str, season: str = "", result: str = "Applied") -> dict:
+    headers = rows[0] if rows else []
+    company_col = header_index(headers, ("company",))
+    role_col = header_index(headers, ("role", "title", "position"))
+    season_col = header_index(headers, ("season",))
+    if company_col < 0:
+        return {"action": "skipped", "row": 0}
+    if not normalize_company(company):
+        return {"action": "skipped", "row": 0}
+    company_hits: list[int] = []
+    role_hits: list[int] = []
+    key_hits: list[int] = []
+    wanted_key = application_key(company, role, season)
+    specific_role = bool(role) and not is_generic_role(role)
     for index, row in enumerate(rows[1:], start=2):
         value = row[company_col] if company_col < len(row) else ""
-        if normalize_company(str(value)) != target:
+        if not extract.companies_match(str(value), company):
             continue
-        hits.append(index)
-        if role and role_col >= 0:
-            current_role = row[role_col] if role_col < len(row) else ""
-            tokens = _role_tokens(role) & _role_tokens(str(current_role))
-            if current_role and (normalize_company(str(current_role)) == normalize_company(role) or len(tokens) >= 2):
-                return index
-    if len(hits) == 1:
-        return hits[0]
-    return 0
+        company_hits.append(index)
+        current_role = row[role_col] if role_col >= 0 and role_col < len(row) else ""
+        current_season = row[season_col] if season_col >= 0 and season_col < len(row) else ""
+        if specific_role and normalize_company(str(current_role)) == normalize_company(role):
+            role_hits.append(index)
+        if application_key(str(value), str(current_role), str(current_season)) == wanted_key:
+            key_hits.append(index)
+    if len(key_hits) == 1:
+        return {"action": "update", "row": key_hits[0]}
+    if len(key_hits) > 1:
+        return {"action": "review", "row": 0}
+    if len(role_hits) == 1:
+        return {"action": "update", "row": role_hits[0]}
+    if len(role_hits) > 1:
+        return {"action": "review", "row": 0}
+    if len(company_hits) == 1:
+        current_role = ""
+        row = rows[company_hits[0] - 1]
+        if role_col >= 0 and role_col < len(row):
+            current_role = str(row[role_col] or "")
+        # OA / interview / offer / rejection mail is about an application you already have, even if it words the role differently.
+        if (
+            not specific_role
+            or is_placeholder(current_role)
+            or normalize_company(current_role) == normalize_company(role)
+            or (result != "Applied" and extract.roles_similar(current_role, role))
+        ):
+            return {"action": "update", "row": company_hits[0]}
+        return {"action": "create", "row": 0}
+    if len(company_hits) > 1 and not specific_role:
+        return {"action": "review", "row": 0}
+    return {"action": "create", "row": 0}
 
 
 def role_should_replace(current: str, nxt: str) -> bool:
@@ -205,13 +223,13 @@ def role_should_replace(current: str, nxt: str) -> bool:
     new = (nxt or "").strip()
     if not new:
         return False
-    if now.lower() in {"", "intern", "internship", "role"} and new.lower() not in {"intern", "internship"}:
+    if is_placeholder(now) and not is_generic_role(new):
         return True
     from tracker.services.mailparse import clean_role_title
 
     if now and new and now != new and clean_role_title(now) == new:
         return True
-    return len(new) > len(now) + 6
+    return False
 
 
 def hint_from_mail(
@@ -223,12 +241,15 @@ def hint_from_mail(
     date_applied: str = "",
     thread_id: str = "",
 ) -> SheetHint:
-    from tracker.services.mailparse import clean_role_title, infer_notes, infer_season
+    from tracker.services.mailparse import clean_role_title, compose_notes, extract_please_note, gmail_url_from_thread, infer_season
 
     blob = f"{title}\n{note}\n{body}"
     location = infer_location(body)
-    notes = infer_notes(body, thread_id) or note
-    role = clean_role_title(title) or title or "Internship"
+    source_url = gmail_url_from_thread(thread_id)
+    useful_note = extract_please_note(body)
+    notes = compose_notes(useful_note or "", source_url) or note
+    role = clean_role_title(title) or title or ""
+    season = infer_season(blob)
     return SheetHint(
         company=company,
         role=role,
@@ -237,35 +258,122 @@ def hint_from_mail(
         result=result_label(status),
         notes=notes,
         date_applied=format_applied_date(date_applied),
-        season=infer_season(blob),
+        season=season,
         location_missing=not bool(location),
+        source_url=source_url,
+        useful_note=useful_note,
+        application_key=application_key(company, role, season),
     )
+
+
+def row_needs_update(row: list[str], headers: list[str], hint: SheetHint) -> bool:
+    date_col = header_index(headers, ("date applied", "applied", "date"))
+    role_col = header_index(headers, ("role", "title", "position"))
+    loc_col = header_index(headers, ("location",))
+    season_col = header_index(headers, ("season",))
+    result_col = header_index(headers, ("result", "status"))
+    notes_col = header_index(headers, ("notes", "note"))
+
+    def cell(col: int) -> str:
+        if col < 0 or col >= len(row):
+            return ""
+        return str(row[col] or "")
+
+    if date_col >= 0 and hint.date_applied and not cell(date_col):
+        return True
+    if role_col >= 0 and hint.role and role_should_replace(cell(role_col), hint.role):
+        return True
+    if loc_col >= 0 and hint.location and not cell(loc_col):
+        return True
+    if season_col >= 0 and hint.season and is_placeholder(cell(season_col)):
+        return True
+    if should_advance(cell(result_col), hint.result):
+        return True
+    if notes_col >= 0 and hint.notes:
+        current = cell(notes_col)
+        if any(part.strip() and part.strip() not in current for part in hint.notes.split("\n")):
+            return True
+    return False
 
 
 def upsert_plan(rows: list[list[str]], hint: SheetHint) -> dict:
     headers = rows[0] if rows else []
     company_col = header_index(headers, ("company",))
     result_col = header_index(headers, ("result", "status"))
-    role_col = header_index(headers, ("role", "title", "position"))
     if company_col < 0 or result_col < 0:
         return {"action": "skipped", "reason": "missing headers"}
-    match_row = find_company_row(rows, company_col, hint.company, hint.role, role_col)
-    if match_row:
-        row = rows[match_row - 1]
-        current = row[result_col] if result_col < len(row) else ""
-        current_role = row[role_col] if role_col >= 0 and role_col < len(row) else ""
-        if should_advance(str(current), hint.result) or role_should_replace(str(current_role), hint.role):
-            return {"action": "update", "row": match_row, "hint": hint}
-        return {"action": "skipped", "row": match_row}
+    match = resolve_row_match(rows, hint.company, hint.role, hint.season, hint.result)
+    if match["action"] == "review":
+        return {"action": "review", "row": 0, "hint": hint}
+    if match["action"] == "update":
+        row = rows[match["row"] - 1]
+        if row_needs_update(row, headers, hint):
+            return {"action": "update", "row": match["row"], "hint": hint}
+        return {"action": "skipped", "row": match["row"]}
     return {
         "action": "create",
-        "row": 2,
+        "row": first_empty_company_row(rows, company_col),
         "hint": hint,
     }
 
 
-def _col_letter(index: int) -> str:
+def apply_hint_grids(grids: dict[str, list[list[str]]], hint: SheetHint) -> dict:
+    tab = hint.tab if hint.tab in grids else INTERNSHIPS_TAB
+    plan = upsert_plan(grids[tab], hint)
+    if plan["action"] == "create":
+        alt = other_tab(tab)
+        if alt in grids:
+            other_plan = upsert_plan(grids[alt], hint)
+            if other_plan.get("action") == "review":
+                return {"action": "review", "row": 0}
+            if other_plan.get("row") and other_plan["action"] in {"update", "skipped"}:
+                if tab_from_role(hint.role) != tab:
+                    # Follow-up mail without a role cannot say which tab is right; keep the row where it is.
+                    tab, plan = alt, other_plan
+                else:
+                    from_row = other_plan["row"]
+                    existing = list(grids[alt][from_row - 1])
+                    dest_headers = grids[tab][0]
+                    dest_company = header_index(dest_headers, ("company",))
+                    dest_row = first_empty_company_row(grids[tab], dest_company)
+                    carried = _realign_row(existing, grids[alt][0], dest_headers)
+                    role_col = header_index(dest_headers, ("role", "title", "position"))
+                    if hint.role and role_col >= 0:
+                        carried[role_col] = ""
+                    merged = _merged_row(dest_headers, hint, carried, tab)
+                    width = max(len(dest_headers), 7)
+                    while len(grids[tab]) < dest_row:
+                        grids[tab].append([""] * width)
+                    grids[tab][dest_row - 1] = merged
+                    grids[alt][from_row - 1] = _blank_identity_row(grids[alt][0], existing)
+                    return {"action": "updated", "row": dest_row, "tab": tab, "from_tab": alt, "from_row": from_row}
+    if plan["action"] == "review":
+        return {"action": "review", "row": 0, "tab": tab}
+    if plan["action"] == "skipped":
+        return {"action": "skipped", "row": plan.get("row") or 0, "tab": tab}
+    headers = grids[tab][0]
+    width = max(len(headers), 7)
+    if plan["action"] == "create":
+        row_number = plan["row"]
+        merged = _merged_row(headers, hint, [""] * width, tab)
+        while len(grids[tab]) < row_number:
+            grids[tab].append([""] * width)
+        grids[tab][row_number - 1] = merged
+        return {"action": "created", "row": row_number, "tab": tab}
+    row_number = plan["row"]
+    existing = list(grids[tab][row_number - 1])
+    grids[tab][row_number - 1] = _merged_row(headers, hint, existing, tab)
+    return {"action": "updated", "row": row_number, "tab": tab}
     return chr(ord("A") + index)
+
+
+def _realign_row(row: list[str], src_headers: list[str], dest_headers: list[str]) -> list[str]:
+    src = {str(header or "").strip().lower(): index for index, header in enumerate(src_headers)}
+    out = []
+    for header in dest_headers:
+        index = src.get(str(header or "").strip().lower(), -1)
+        out.append(row[index] if 0 <= index < len(row) else "")
+    return out
 
 
 def _merged_row(headers: list[str], hint: SheetHint, existing: list[str] | None, tab: str) -> list[str]:
@@ -286,6 +394,10 @@ def _merged_row(headers: list[str], hint: SheetHint, existing: list[str] | None,
         "status": hint.result,
         "notes": hint.notes,
         "note": hint.notes,
+        "source email": hint.source_url,
+        "source": hint.source_url,
+        "gmail": hint.source_url,
+        "email link": hint.source_url,
     }
     row = list(existing)
     for index, header in enumerate(headers):
@@ -293,8 +405,11 @@ def _merged_row(headers: list[str], hint: SheetHint, existing: list[str] | None,
         value = mapping.get(key, "")
         current = str(row[index] or "")
         if key in {"notes", "note"} and value:
-            if value not in current:
-                row[index] = f"{value}\n{current}".strip() if current else value
+            parts = [part.strip() for part in str(value).split("\n") if part.strip()]
+            for part in parts:
+                if part not in current:
+                    current = f"{current}\n{part}".strip() if current else part
+            row[index] = current
             continue
         if key in {"result", "status"}:
             if should_advance(current, str(value)) or not current:
@@ -306,11 +421,21 @@ def _merged_row(headers: list[str], hint: SheetHint, existing: list[str] | None,
             elif not current and value:
                 row[index] = value
             continue
+        if key in {"location"}:
+            if value and not current:
+                row[index] = value
+            continue
+        if key in {"season"}:
+            if value and is_placeholder(current):
+                row[index] = value
+            continue
         if value and not current:
             row[index] = value
         elif key == "company" and value:
             row[index] = value
         elif key in {"date applied", "applied", "date"} and value and not current:
+            row[index] = value
+        elif key in {"source email", "source", "gmail", "email link"} and value and not current:
             row[index] = value
     return row
 
@@ -343,7 +468,7 @@ def _blank_identity_row(headers: list[str], existing: list[str]) -> list[str]:
     row = list(existing)
     while len(row) < len(headers):
         row.append("")
-    for names in (("company",), ("role", "title", "position"), ("date applied", "applied", "date"), ("location",), ("notes", "note")):
+    for names in (("company",), ("role", "title", "position"), ("date applied", "applied", "date"), ("location",), ("season",), ("result", "status"), ("notes", "note"), ("source email", "source", "gmail", "email link")):
         col = header_index(headers, names)
         if col >= 0:
             row[col] = ""
@@ -376,8 +501,9 @@ def push_hints(creds, spreadsheet_id: str, hints: list[SheetHint]) -> dict:
     created = 0
     updated = 0
     skipped = 0
+    review = 0
     if not spreadsheet_id or not hints:
-        return {"created": created, "updated": updated, "skipped": skipped}
+        return {"created": created, "updated": updated, "skipped": skipped, "review": review}
     service = build("sheets", "v4", credentials=creds, cache_discovery=False)
     tabs = {INTERNSHIPS_TAB, NEWGRAD_TAB} | {hint.tab for hint in hints}
     grids: dict[str, list[list[str]]] = {}
@@ -385,48 +511,29 @@ def push_hints(creds, spreadsheet_id: str, hints: list[SheetHint]) -> dict:
         payload = _sheets_execute(
             service.spreadsheets()
             .values()
-            .get(spreadsheetId=spreadsheet_id, range=f"'{tab}'!A1:G200")
+            .get(spreadsheetId=spreadsheet_id, range=f"'{tab}'!A1:G")
         )
         grids[tab] = payload.get("values") or [["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"]]
     writes: list[dict] = []
     dirty_tabs: set[str] = set()
     for hint in hints:
-        plan = upsert_plan(grids.get(hint.tab) or grids[INTERNSHIPS_TAB], hint)
-        if plan["action"] == "create":
-            alt = other_tab(hint.tab)
-            if alt in grids:
-                other_plan = upsert_plan(grids[alt], hint)
-                if other_plan.get("row") and other_plan["action"] != "create":
-                    from_row = other_plan["row"]
-                    headers_from = grids[alt][0]
-                    existing = list(grids[alt][from_row - 1]) if from_row < len(grids[alt]) else []
-                    merged = _merged_row(headers_from, hint, existing, hint.tab)
-                    grids[hint.tab].insert(1, merged)
-                    grids[alt][from_row - 1] = _blank_identity_row(headers_from, existing)
-                    dirty_tabs.add(hint.tab)
-                    dirty_tabs.add(alt)
-                    updated += 1
-                    continue
-        action = plan["action"]
+        result = apply_hint_grids(grids, hint)
+        action = result["action"]
+        if action == "review":
+            review += 1
+            continue
         if action == "skipped":
             skipped += 1
             continue
-        headers = grids[hint.tab][0]
-        width = max(len(headers), 7)
-        if action == "create":
-            merged = _merged_row(headers, hint, [""] * width, hint.tab)
-            grids[hint.tab].insert(1, merged)
+        if action == "created":
             created += 1
         else:
-            row_number = plan["row"]
-            while len(grids[hint.tab]) < row_number:
-                grids[hint.tab].append([""] * width)
-            existing = list(grids[hint.tab][row_number - 1])
-            grids[hint.tab][row_number - 1] = _merged_row(headers, hint, existing, hint.tab)
             updated += 1
-        dirty_tabs.add(hint.tab)
+        dirty_tabs.add(result["tab"])
+        if result.get("from_tab"):
+            dirty_tabs.add(result["from_tab"])
     for tab in dirty_tabs:
-        grid = sort_filled_latest_first(grids[tab])
+        grid = grids[tab]
         last_col = _col_letter(max(len(grid[0]) - 1, 0))
         writes.append({"range": f"'{tab}'!A1:{last_col}{len(grid)}", "values": grid})
     if writes:
@@ -438,4 +545,4 @@ def push_hints(creds, spreadsheet_id: str, hints: list[SheetHint]) -> dict:
                 body={"valueInputOption": "USER_ENTERED", "data": writes},
             )
         )
-    return {"created": created, "updated": updated, "skipped": skipped}
+    return {"created": created, "updated": updated, "skipped": skipped, "review": review}

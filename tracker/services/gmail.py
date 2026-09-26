@@ -10,12 +10,18 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
+# Same search as GMAIL_QUERY_TERMS in sheets-addon/Code.gs.
 GMAIL_QUERY = (
     "newer_than:730d "
-    "(subject:application OR subject:applied OR subject:interview OR subject:assessment "
-    "OR subject:hackerrank OR subject:codesignal OR subject:offer OR subject:unfortunately "
-    "OR from:recruiting OR from:careers OR from:talent OR from:university "
-    "OR subject:\"thank you for applying\" OR subject:\"application received\")"
+    '(subject:"thank you for applying" OR subject:"thanks for applying" OR subject:"application received" OR '
+    'subject:"we have received your application" OR subject:"thank you for your application" OR '
+    'subject:"your application" OR subject:"application confirmation" OR subject:"application to" OR '
+    'subject:"application for" OR subject:"applying to" OR subject:"thank you for your interest" OR '
+    'subject:"online assessment" OR subject:hackerrank OR subject:codesignal OR subject:"interview invitation" OR '
+    'subject:"phone screen" OR subject:"offer of employment" OR subject:unfortunately OR '
+    "from:recruiting OR from:careers OR from:university OR from:talent OR from:hiring OR "
+    "from:myworkday.com OR from:greenhouse-mail.io OR from:ashbyhq.com OR from:icims.com OR "
+    "from:lever.co OR from:smartrecruiters.com)"
 )
 
 

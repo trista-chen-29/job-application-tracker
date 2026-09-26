@@ -428,6 +428,126 @@ class MailParseTests(TestCase):
         self.assertEqual(opp.status, OpportunityStatus.APPLIED)
 
 
+class ExtractionTests(TestCase):
+    """Formats seen in real recruiter mail; keep in step with sheets-addon/Code.gs."""
+
+    def parse(self, from_header, subject, body):
+        from tracker.services.extract import parse_mail
+
+        return parse_mail(from_header, subject, body)
+
+    def test_volume_disclaimer_is_not_a_rejection(self):
+        parsed = self.parse(
+            '"myworkday.com" <acme@myworkday.com>',
+            "Thank you for applying to Acme Bank",
+            "Thank you for applying for Software Engineer - API Platform, Officer position here at Acme Bank. "
+            "Unfortunately, due to the high volume of applications we are unable to provide feedback to everyone.",
+        )
+        self.assertEqual(parsed["result"], "Applied")
+        self.assertEqual(parsed["company"], "Acme Bank")
+        self.assertEqual(parsed["role"], "Software Engineer - API Platform, Officer")
+
+    def test_regret_to_inform_is_a_rejection(self):
+        parsed = self.parse(
+            "Acme Hiring Team <notifications@careers.acme.com>",
+            "Your Acme Application Status",
+            "After careful consideration, we regret to inform you that you have not been selected to move forward.",
+        )
+        self.assertEqual(parsed["result"], "Rejected")
+        self.assertEqual(parsed["company"], "Acme")
+
+    def test_own_replies_are_ignored(self):
+        self.assertIsNone(
+            self.parse("Me <someone@gmail.com>", "Re: Initial offer of Employment - Acme - Seasonal Technician", "Thanks!")
+        )
+
+    def test_recruiter_name_is_not_the_company(self):
+        parsed = self.parse(
+            "Pat Lee <pat.lee@acme.com>",
+            "Initial offer of Employment - Acme Materials - Seasonal Associate Technician - Springfield",
+            "You can electronically sign your offer letter.",
+        )
+        self.assertEqual(parsed["company"], "Acme Materials")
+        self.assertEqual(parsed["role"], "Seasonal Associate Technician")
+        self.assertEqual(parsed["result"], "Offer")
+        self.assertEqual(parsed["tab"], "internships")
+
+    def test_workday_sender_names(self):
+        self.assertEqual(self.parse("Workday Microchip <microchiphr@myworkday.com>", "Thank you for applying!", "Thank you so much for applying!")["company"], "Microchip")
+        self.assertEqual(
+            self.parse("workday-no-reply f5 <ffive@myworkday.com>", "Thank you for applying!", "We appreciate your interest in F5 and the Software Engineer I position.")["company"],
+            "F5",
+        )
+
+    def test_role_and_company_from_role_at_company(self):
+        parsed = self.parse(
+            "no-reply@us.greenhouse-mail.io",
+            "Thank You for Applying to AI-Native Software Engineer (New Grad) | Study.com",
+            "Thanks for applying to AI-Native Software Engineer (New Grad) at Study.com. Your application has been received.",
+        )
+        self.assertEqual(parsed["company"], "Study.com")
+        self.assertEqual(parsed["role"], "AI-Native Software Engineer (New Grad)")
+        self.assertEqual(parsed["tab"], "newgrad")
+
+    def test_role_ids_and_seasons_are_stripped(self):
+        parsed = self.parse(
+            "noreply@mail.amazon.jobs",
+            "Thank you for Applying to Amazon!",
+            "We've received your application for the Software Development Engineer Intern, Amazon Leo - Summer 2027 (USA) (ID: 10559762) position.",
+        )
+        self.assertEqual(parsed["role"], "Software Development Engineer Intern, Amazon Leo (USA)")
+        self.assertEqual(parsed["season"], "Summer 2027")
+
+    def test_ignored_company_and_student_jobs(self):
+        self.assertIsNone(
+            self.parse("SJSU Student Union <jobs@pinpointhq.com>", "Application Received – Student IT Technician", "Application received.")
+        )
+
+    def test_oa_confirmation_keeps_applied_date(self):
+        parsed = self.parse(
+            "Ramp Talent Team <no-reply@ashbyhq.com>",
+            "Ramp | Confirmation on your Application + CodeSignal",
+            "Thank you for taking the time to apply to our Software Engineer opening at Ramp! Your application has been received "
+            "and will be reviewed as soon as you complete the CodeSignal assessment.",
+        )
+        self.assertEqual(parsed["result"], "OA")
+        self.assertTrue(parsed["confirmation"])
+        self.assertEqual(parsed["company"], "Ramp")
+
+    def test_follow_up_roles_that_differ_stay_separate(self):
+        from tracker.services.gsheet import SheetHint, apply_hint_grids
+
+        intern = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["", "NetApp", "Intern - Software Engineer (Cloud Storage)", "", "", "Rejected", ""],
+        ]
+        grids = {"internships": intern, "newgrad": [["Date Applied", "Company", "Role", "Location", "Result", "Notes"]]}
+        other = SheetHint(
+            company="NetApp", role="Intern - Software Engineer (Systems)", location="", tab="internships",
+            result="Rejected", notes="", date_applied="",
+        )
+        self.assertEqual(apply_hint_grids(grids, other)["action"], "created")
+
+    def test_offer_with_reworded_role_updates_the_application(self):
+        from tracker.services.gsheet import SheetHint, apply_hint_grids
+
+        intern = [["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"]]
+        grad = [
+            ["Date Applied", "Company", "Role", "Location", "Result", "Notes"],
+            ["04/08/2026", "Acme Materials", "Associate Test Technician", "", "Applied", ""],
+        ]
+        grids = {"internships": intern, "newgrad": grad}
+        offer = SheetHint(
+            company="Acme Materials Inc", role="Seasonal Associate Technician", location="Springfield, CA",
+            tab="internships", result="Offer", notes="", date_applied="",
+        )
+        result = apply_hint_grids(grids, offer)
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(result["tab"], "internships")
+        self.assertEqual(intern[1][:6], ["04/08/2026", "Acme Materials Inc", "Seasonal Associate Technician", "Springfield, CA", "", "Offer"])
+        self.assertEqual(grad[1][1], "")
+
+
 class GoogleSheetFillTests(TestCase):
     def test_spreadsheet_id_from_share_link(self):
         from tracker.services.gsheet import spreadsheet_id_from_url
@@ -569,7 +689,11 @@ class GoogleSheetFillTests(TestCase):
             date_applied="2026-09-24",
         )
         plan = upsert_plan(rows, hint)
-        self.assertEqual(plan["action"], "skipped")
+        self.assertIn(plan["action"], {"skipped", "update"})
+        from tracker.services.gsheet import _merged_row
+
+        merged = _merged_row(rows[0], hint, rows[1], "internships")
+        self.assertEqual(merged[5], "Offer")
 
     def test_databricks_intern_email_fills_like_manual_entry(self):
         from tracker.constants import OpportunityStatus
@@ -591,13 +715,18 @@ class GoogleSheetFillTests(TestCase):
             body,
             "msg-1",
             "thread-databricks",
+            "2026-09-24",
         )
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.company, "Databricks")
         self.assertEqual(parsed.title, "Software Engineering Intern")
         self.assertEqual(parsed.status, OpportunityStatus.APPLIED)
+        self.assertEqual(parsed.date_applied, "09/24/2026")
+        self.assertEqual(parsed.season, "Winter 2027")
+        self.assertEqual(parsed.location, "")
         self.assertIn("official communication from Databricks", parsed.note)
-        self.assertIn("https://mail.google.com/mail/u/0/#all/thread-databricks", parsed.note)
+        self.assertIn("Source: https://mail.google.com/mail/u/0/#all/thread-databricks", parsed.note)
+        self.assertNotIn("Do not reply", parsed.note)
 
         hint = hint_from_mail(
             parsed.company,
@@ -616,7 +745,279 @@ class GoogleSheetFillTests(TestCase):
         self.assertEqual(hint.location, "")
         self.assertTrue(hint.location_missing)
         self.assertIn("@databricks.com", hint.notes)
-        self.assertIn("thread-databricks", hint.notes)
+        self.assertIn("Source: https://mail.google.com/mail/u/0/#all/thread-databricks", hint.notes)
+        from tracker.services.gsheet import location_should_highlight
+
+        self.assertTrue(location_should_highlight(hint.location, hint.location_missing))
+
+    def test_season_only_uses_dropdown_values(self):
+        from tracker.services.mailparse import infer_season
+
+        self.assertEqual(infer_season("Software Engineering Intern (2027 Start) - Winter"), "Winter 2027")
+        self.assertEqual(infer_season("Spring 2027 Data Intern"), "Spring 2027")
+        self.assertEqual(infer_season("Summer 2027 SWE Intern"), "Summer 2027")
+        self.assertEqual(infer_season("Fall 2027 co-op"), "")
+        self.assertEqual(infer_season("Summer 2026 internship"), "")
+        self.assertEqual(infer_season("our summer internship program"), "")
+
+    def test_rejection_date_is_not_the_applied_date(self):
+        from tracker.services.mailparse import parse_message
+
+        hint = parse_message(
+            "Databricks University Recruiting <no-reply@databricks.com>",
+            "Your application to Databricks",
+            "Unfortunately, we will not be moving forward with your application to Databricks.",
+            date_applied="10/15/2026",
+        )
+        self.assertIsNotNone(hint)
+        self.assertEqual(hint.status, OpportunityStatus.REJECTED)
+        self.assertEqual(hint.date_applied, "")
+
+    def test_switching_sheet_requeues_logged_mail(self):
+        from tracker.models import GmailAccount, GmailProcessedMessage
+        from tracker.services.mailparse import PARSER_VERSION
+        from tracker.views import _stale_message_ids
+
+        user = User.objects.create_user("switch", "switch@example.com", "pass12345")
+        GmailAccount.objects.create(user=user, token_json="{}", spreadsheet_id="oldSheetId1234567890abcdef")
+        GmailProcessedMessage.objects.create(
+            user=user, message_id="done-1", parser_version=PARSER_VERSION, parse_status="applied"
+        )
+        self.assertNotIn("done-1", _stale_message_ids(user))
+        self.client.force_login(user)
+        self.client.post(
+            reverse("gmail_connect"),
+            {
+                "save_sheet": "1",
+                "spreadsheet_url": "https://docs.google.com/spreadsheets/d/newSheetId1234567890abcdef/edit",
+            },
+        )
+        self.assertEqual(GmailAccount.objects.get(user=user).spreadsheet_id, "newSheetId1234567890abcdef")
+        self.assertIn("done-1", _stale_message_ids(user))
+
+    def test_same_company_same_role_updates_one_row(self):
+        from tracker.services.gsheet import SheetHint, apply_hint_grids
+
+        intern = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["09/24/2026", "Databricks", "Software Engineering Intern", "", "Winter 2027", "Applied", ""],
+        ]
+        grids = {"internships": intern, "newgrad": [["Date Applied", "Company", "Role", "Location", "Result", "Notes"]]}
+        hint = SheetHint(
+            company="Databricks",
+            role="Software Engineering Intern",
+            location="",
+            tab="internships",
+            result="OA",
+            notes="Source: https://mail.google.com/mail/u/0/#all/oa",
+            date_applied="09/24/2026",
+            season="Winter 2027",
+        )
+        result = apply_hint_grids(grids, hint)
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(result["row"], 2)
+        filled = [row for row in grids["internships"][1:] if row[1]]
+        self.assertEqual(len(filled), 1)
+        self.assertEqual(grids["internships"][1][5], "OA")
+
+    def test_same_company_two_roles_stay_separate(self):
+        from tracker.services.gsheet import SheetHint, upsert_plan
+
+        rows = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["09/01/2026", "Databricks", "Software Engineering Intern", "", "Winter 2027", "Applied", ""],
+            ["09/02/2026", "Databricks", "Data Science Intern", "", "Summer 2027", "Applied", ""],
+        ]
+        hint = SheetHint(
+            company="Databricks",
+            role="Data Science Intern",
+            location="",
+            tab="internships",
+            result="Interview",
+            notes="",
+            date_applied="09/02/2026",
+            season="Summer 2027",
+        )
+        plan = upsert_plan(rows, hint)
+        self.assertEqual(plan["action"], "update")
+        self.assertEqual(plan["row"], 3)
+
+    def test_applied_row_repairs_blank_date_location_notes(self):
+        from tracker.services.gsheet import SheetHint, apply_hint_grids
+
+        intern = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["", "Databricks", "Software Engineering Intern", "", "", "Applied", ""],
+        ]
+        grids = {"internships": intern, "newgrad": [["Date Applied", "Company", "Role", "Location", "Result", "Notes"]]}
+        hint = SheetHint(
+            company="Databricks",
+            role="Software Engineering Intern",
+            location="San Francisco, CA",
+            tab="internships",
+            result="Applied",
+            notes="Source: https://mail.google.com/mail/u/0/#all/x",
+            date_applied="09/24/2026",
+            season="Winter 2027",
+        )
+        result = apply_hint_grids(grids, hint)
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(intern[1][0], "09/24/2026")
+        self.assertEqual(intern[1][3], "San Francisco, CA")
+        self.assertEqual(intern[1][4], "Winter 2027")
+        self.assertIn("Source:", intern[1][6])
+        self.assertEqual(intern[1][5], "Applied")
+
+    def test_manual_location_is_preserved(self):
+        from tracker.services.gsheet import SheetHint, _merged_row
+
+        headers = ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"]
+        existing = ["09/24/2026", "Databricks", "Software Engineering Intern", "Seattle, WA", "Winter 2027", "Applied", ""]
+        hint = SheetHint(
+            company="Databricks",
+            role="Software Engineering Intern",
+            location="San Francisco, CA",
+            tab="internships",
+            result="Applied",
+            notes="",
+            date_applied="09/24/2026",
+            season="Winter 2027",
+        )
+        merged = _merged_row(headers, hint, existing, "internships")
+        self.assertEqual(merged[3], "Seattle, WA")
+
+    def test_new_application_uses_first_blank_company_row(self):
+        from tracker.constants import OpportunityStatus
+        from tracker.services.gsheet import hint_from_mail, upsert_plan
+
+        rows = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["09/01/2026", "OldCo", "Intern", "", "", "Applied", ""],
+            ["", "", "", "", "", "Applied", ""],
+            ["", "", "", "", "", "Applied", ""],
+        ]
+        hint = hint_from_mail(
+            "Stripe",
+            "Software Engineer Intern",
+            OpportunityStatus.APPLIED,
+            "",
+            "We have received your application for the Software Engineer Intern role. Location: New York, NY",
+            "2026-09-24",
+        )
+        plan = upsert_plan(rows, hint)
+        self.assertEqual(plan["action"], "create")
+        self.assertEqual(plan["row"], 3)
+
+    def test_moving_tabs_clears_the_old_row(self):
+        from tracker.services.gsheet import SheetHint, apply_hint_grids
+
+        intern = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["09/24/2026", "Acme", "Software Engineer New Grad", "", "", "Applied", "old note"],
+        ]
+        grad = [
+            ["Date Applied", "Company", "Role", "Location", "Result", "Notes"],
+            ["", "", "", "", "Applied", ""],
+        ]
+        grids = {"internships": intern, "newgrad": grad}
+        hint = SheetHint(
+            company="Acme",
+            role="Software Engineer New Grad",
+            location="",
+            tab="newgrad",
+            result="Applied",
+            notes="Source: https://mail.google.com/mail/u/0/#all/y",
+            date_applied="09/24/2026",
+        )
+        result = apply_hint_grids(grids, hint)
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(intern[1][1], "")
+        self.assertEqual(intern[1][0], "")
+        self.assertEqual(intern[1][5], "")
+        self.assertEqual(intern[1][6], "")
+        self.assertEqual(grad[1][1], "Acme")
+        self.assertEqual(grad[1][2], "Software Engineer New Grad")
+
+    def test_rejection_without_role_updates_internship_in_place(self):
+        from tracker.services.gsheet import SheetHint, apply_hint_grids
+
+        intern = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["09/24/2026", "Databricks", "Software Engineering Intern", "", "Winter 2027", "Applied", ""],
+        ]
+        grad = [
+            ["Date Applied", "Company", "Role", "Location", "Result", "Notes"],
+            ["", "", "", "", "Applied", ""],
+        ]
+        grids = {"internships": intern, "newgrad": grad}
+        hint = SheetHint(
+            company="Databricks",
+            role="",
+            location="",
+            tab="newgrad",
+            result="Rejected",
+            notes="",
+            date_applied="",
+        )
+        result = apply_hint_grids(grids, hint)
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(result["tab"], "internships")
+        self.assertEqual(intern[1][1:6], ["Databricks", "Software Engineering Intern", "", "Winter 2027", "Rejected"])
+        self.assertEqual(intern[1][0], "09/24/2026")
+        self.assertEqual(grad[1][1], "")
+
+    def test_reprocess_after_parser_version_increment(self):
+        from tracker.models import GmailProcessedMessage
+        from tracker.services.mailparse import PARSER_VERSION
+        from tracker.views import _stale_message_ids
+
+        user = User.objects.create_user("reprocess", "reprocess@example.com", "pass12345")
+        GmailProcessedMessage.objects.create(
+            user=user, message_id="old-1", parser_version=PARSER_VERSION - 1, parse_status="applied"
+        )
+        GmailProcessedMessage.objects.create(
+            user=user, message_id="current-1", parser_version=PARSER_VERSION, parse_status="applied"
+        )
+        GmailProcessedMessage.objects.create(
+            user=user, message_id="failed-1", parser_version=PARSER_VERSION, parse_status="failed", last_error="sheet 429"
+        )
+        stale = set(_stale_message_ids(user, limit=10))
+        self.assertIn("old-1", stale)
+        self.assertIn("failed-1", stale)
+        self.assertNotIn("current-1", stale)
+
+    def test_failed_update_is_retryable(self):
+        from tracker.models import GmailProcessedMessage
+        from tracker.services.mailparse import PARSER_VERSION
+        from tracker.views import _done_message_ids, _stale_message_ids
+
+        user = User.objects.create_user("failretry", "failretry@example.com", "pass12345")
+        GmailProcessedMessage.objects.create(
+            user=user, message_id="boom", parser_version=PARSER_VERSION, parse_status="failed", last_error="timeout"
+        )
+        self.assertIn("boom", _stale_message_ids(user))
+        self.assertNotIn("boom", _done_message_ids(user))
+
+    def test_ambiguous_roles_are_marked_review(self):
+        from tracker.services.gsheet import SheetHint, upsert_plan
+
+        rows = [
+            ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"],
+            ["09/01/2026", "Databricks", "Software Engineering Intern", "", "Winter 2027", "Applied", ""],
+            ["09/02/2026", "Databricks", "Software Engineering Intern", "", "Summer 2027", "Applied", ""],
+        ]
+        hint = SheetHint(
+            company="Databricks",
+            role="Software Engineering Intern",
+            location="",
+            tab="internships",
+            result="OA",
+            notes="",
+            date_applied="09/24/2026",
+            season="",
+        )
+        plan = upsert_plan(rows, hint)
+        self.assertEqual(plan["action"], "review")
 
     def test_merged_row_keeps_offer_and_upgrades_title(self):
         from tracker.services.gsheet import SheetHint, _merged_row

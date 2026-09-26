@@ -9,8 +9,13 @@ from tracker.services.parsing import infer_sponsorship, infer_work_arrangement, 
 from tracker.services.skills import replace_opportunity_skills
 
 
-def change_status(opportunity: Opportunity, new_status: str, note: str = "") -> None:
+def change_status(opportunity: Opportunity, new_status: str, note: str = "", applied_at=None) -> None:
     if new_status == opportunity.status:
+        if applied_at:
+            application, _ = Application.objects.get_or_create(opportunity=opportunity)
+            if application.applied_at is None:
+                application.applied_at = applied_at
+                application.save(update_fields=["applied_at"])
         return
     StatusHistory.objects.create(
         opportunity=opportunity,
@@ -24,7 +29,7 @@ def change_status(opportunity: Opportunity, new_status: str, note: str = "") -> 
     if new_status in APPLIED_OR_LATER:
         application, _ = Application.objects.get_or_create(opportunity=opportunity)
         if application.applied_at is None:
-            application.applied_at = timezone.now()
+            application.applied_at = applied_at or timezone.now()
             application.save(update_fields=["applied_at"])
 
 

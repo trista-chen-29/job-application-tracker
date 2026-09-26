@@ -73,7 +73,7 @@ from tracker.services.gmail import (
     refresh_if_needed,
 )
 from tracker.services.gsheet import hint_from_mail, push_hints, spreadsheet_id_from_url
-from tracker.services.mailparse import PARSER_VERSION, apply_mail_hints, parse_message, parse_pasted_emails
+from tracker.services.mailparse import PARSER_VERSION, apply_mail_hints, parse_message, parse_pasted_emails, to_sheet_hint
 from tracker.services.workflow import (
     change_status,
     duplicate_opportunity,
@@ -882,11 +882,16 @@ class GmailConnectView(LoginRequiredMixin, View):
             if not sheet_id:
                 messages.error(request, "Paste the full Google Sheet link.")
                 return redirect("gmail_connect")
+            previous = request.session.get("spreadsheet_id") or ""
             request.session["spreadsheet_id"] = sheet_id
             account = GmailAccount.objects.filter(user=request.user).first()
             if account:
+                previous = account.spreadsheet_id or previous
                 account.spreadsheet_id = sheet_id
                 account.save(update_fields=["spreadsheet_id", "updated_at"])
+            if previous and previous != sheet_id:
+                # A different sheet has none of the rows, so every logged message must be re-applied.
+                GmailProcessedMessage.objects.filter(user=request.user).update(parse_status="")
             messages.success(request, "Google Sheet saved. Sync will write to the internships and newgrad tabs.")
             return redirect("gmail_connect")
         pasted = request.POST.get("pasted") or ""
@@ -955,6 +960,115 @@ class GmailDisconnectView(LoginRequiredMixin, View):
         return redirect("gmail_connect")
 
 
+def _done_message_ids(user):
+    return set(
+        GmailProcessedMessage.objects.filter(
+            user=user,
+            parser_version__gte=PARSER_VERSION,
+            parse_status__in=["applied", "ignored"],
+        ).values_list("message_id", flat=True)
+    )
+
+
+def _stale_message_ids(user, limit: int = 30) -> list[str]:
+    from django.db.models import Q
+
+    return list(
+        GmailProcessedMessage.objects.filter(user=user)
+        .filter(Q(parser_version__lt=PARSER_VERSION) | Q(parse_status__in=["", "failed", "review"]))
+        .order_by("id")
+        .values_list("message_id", flat=True)[:limit]
+    )
+
+
+def _save_gmail_log(user, message_id: str, **fields):
+    record, _created = GmailProcessedMessage.objects.get_or_create(user=user, message_id=message_id)
+    for key, value in fields.items():
+        setattr(record, key, value)
+    record.synced_at = timezone.now()
+    record.save()
+    return record
+
+
+def _process_gmail_items(user, creds, items, sheet_id: str) -> dict:
+    counts = {"created": 0, "updated": 0, "skipped": 0, "review": 0, "failed": 0}
+    hints = []
+    for item in sorted(items, key=lambda entry: _mail_timestamp(entry.get("date") or "")):
+        try:
+            hint = parse_message(
+                item["from"],
+                item["subject"],
+                item["body"],
+                item["id"],
+                item.get("threadId") or "",
+                _mail_date(item.get("date") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            counts["failed"] += 1
+            _save_gmail_log(
+                user,
+                item.get("id") or "",
+                thread_id=item.get("threadId") or "",
+                subject=item.get("subject") or "",
+                parser_version=PARSER_VERSION,
+                parse_status="failed",
+                last_error=str(exc),
+            )
+            continue
+        if not hint:
+            counts["skipped"] += 1
+            _save_gmail_log(
+                user,
+                item["id"],
+                thread_id=item.get("threadId") or "",
+                subject=item.get("subject") or "",
+                parser_version=PARSER_VERSION,
+                parse_status="ignored",
+                last_error="",
+            )
+            continue
+        hints.append(hint)
+    local = apply_mail_hints(user, hints) if hints else {"created": 0, "updated": 0, "skipped": 0, "review": 0}
+    for key in ("created", "updated", "skipped", "review"):
+        counts[key] += local.get(key, 0)
+    sheet_result = None
+    if sheet_id and hints:
+        sheet_hints = [to_sheet_hint(hint) for hint in hints]
+        try:
+            sheet_result = push_hints(creds, sheet_id, sheet_hints)
+        except Exception as exc:  # noqa: BLE001
+            counts["failed"] += len(hints)
+            for hint in hints:
+                _save_gmail_log(
+                    user,
+                    hint.source_id,
+                    thread_id=hint.thread_id,
+                    subject="",
+                    parser_version=PARSER_VERSION,
+                    parse_status="failed",
+                    application_key=hint.application_key,
+                    tab=hint.tab,
+                    last_error=str(exc),
+                )
+            return counts
+    for hint in hints:
+        status = "review" if local.get("review") and False else "applied"
+        _save_gmail_log(
+            user,
+            hint.source_id,
+            thread_id=hint.thread_id,
+            subject="",
+            parser_version=PARSER_VERSION,
+            parse_status=status,
+            application_key=hint.application_key,
+            tab=hint.tab,
+            last_error="",
+        )
+    if sheet_result:
+        counts["sheet"] = sheet_result
+    return counts
+
+
 class GmailSyncView(LoginRequiredMixin, View):
     def get(self, request):
         return self.post(request)
@@ -967,74 +1081,27 @@ class GmailSyncView(LoginRequiredMixin, View):
         try:
             creds = refresh_if_needed(credentials_from_json(account.token_json))
             account.token_json = credentials_to_json(creds)
-            skip_ids = set(
-                GmailProcessedMessage.objects.filter(user=request.user).values_list("message_id", flat=True)
-            )
-            raw_messages = fetch_job_messages(creds, skip_ids=skip_ids, limit=25)
-            stale_ids = list(
-                GmailProcessedMessage.objects.filter(user=request.user, parser_version__lt=PARSER_VERSION)
-                .order_by("id")
-                .values_list("message_id", flat=True)[:20]
-            )
+            raw_messages = fetch_job_messages(creds, skip_ids=_done_message_ids(request.user), limit=25)
+            stale_ids = _stale_message_ids(request.user, limit=20)
             if stale_ids:
                 raw_messages.extend(fetch_messages_by_ids(creds, stale_ids))
         except Exception as exc:  # noqa: BLE001
             messages.error(request, f"Gmail sync failed ({exc}).")
             return redirect("gmail_connect")
-        hints = []
-        bodies: list[str] = []
-        dates: list[str] = []
-        scanned = len(raw_messages)
-        for item in raw_messages:
-            hint = parse_message(
-                item["from"],
-                item["subject"],
-                item["body"],
-                item["id"],
-                item.get("threadId") or "",
-            )
-            record, _created = GmailProcessedMessage.objects.get_or_create(
-                user=request.user, message_id=item["id"]
-            )
-            if record.parser_version != PARSER_VERSION:
-                record.parser_version = PARSER_VERSION
-                record.save(update_fields=["parser_version"])
-            if hint:
-                hints.append(hint)
-                bodies.append(item.get("body") or "")
-                dates.append(_mail_date(item.get("date") or ""))
-        result = apply_mail_hints(request.user, hints)
-        sheet_result = None
         sheet_id = account.spreadsheet_id or request.session.get("spreadsheet_id") or getattr(settings, "GOOGLE_SHEET_ID", "")
-        sheet_hints = [
-            hint_from_mail(
-                hint.company,
-                hint.title,
-                hint.status,
-                hint.note,
-                body,
-                date_applied,
-                hint.thread_id,
-            )
-            for hint, body, date_applied in zip(hints, bodies, dates)
-        ]
+        counts = _process_gmail_items(request.user, creds, raw_messages, sheet_id)
         if sheet_id:
-            sheet_hints.extend(_local_opportunity_hints(request.user))
-            try:
-                sheet_result = push_hints(creds, sheet_id, sheet_hints)
-                account.spreadsheet_id = sheet_id
-            except Exception as exc:  # noqa: BLE001
-                messages.error(request, f"Gmail read worked, but the Google Sheet update failed ({exc}).")
+            account.spreadsheet_id = sheet_id
         account.last_synced_at = timezone.now()
         account.save(update_fields=["token_json", "last_synced_at", "spreadsheet_id"])
         extra = ""
-        if sheet_result:
-            extra = f" Google Sheet: added {sheet_result['created']}, updated {sheet_result['updated']}."
+        if counts.get("sheet"):
+            extra = f" Google Sheet: added {counts['sheet']['created']}, updated {counts['sheet']['updated']}."
         messages.success(
             request,
-            f"Gmail sync complete. Read {scanned} messages."
-            f" {len(hints)} useful → added {result['created']}, updated {result['updated']}.{extra}"
-            f" New mail and status updates are applied to the same company row. Click Sync now again for the next batch.",
+            f"Gmail sync complete. Read {len(raw_messages)} messages. "
+            f"Added {counts['created']}, updated {counts['updated']}, skipped {counts['skipped']}, "
+            f"review {counts['review']}, failed {counts['failed']}.{extra}",
         )
         return redirect("home")
 
@@ -1051,72 +1118,39 @@ class GmailRecheckView(LoginRequiredMixin, View):
         try:
             creds = refresh_if_needed(credentials_from_json(account.token_json))
             account.token_json = credentials_to_json(creds)
-            remaining = list(
-                GmailProcessedMessage.objects.filter(user=request.user, parser_version__lt=PARSER_VERSION)
-                .order_by("id")
-                .values_list("message_id", flat=True)[:30]
-            )
+            remaining = _stale_message_ids(request.user, limit=30)
             if not remaining:
                 messages.success(request, "All scraped emails have already been rechecked with the current parser.")
                 return redirect("gmail_connect")
             raw_messages = fetch_messages_by_ids(creds, remaining, limit=30)
+            fetched_ids = {item["id"] for item in raw_messages}
+            for message_id in remaining:
+                if message_id not in fetched_ids:
+                    _save_gmail_log(
+                        request.user,
+                        message_id,
+                        parser_version=PARSER_VERSION,
+                        parse_status="failed",
+                        last_error="Gmail could not fetch this message.",
+                    )
         except Exception as exc:  # noqa: BLE001
             messages.error(request, f"Gmail recheck failed ({exc}).")
             return redirect("gmail_connect")
-        hints = []
-        bodies: list[str] = []
-        dates: list[str] = []
-        for item in raw_messages:
-            hint = parse_message(
-                item["from"],
-                item["subject"],
-                item["body"],
-                item["id"],
-                item.get("threadId") or "",
-            )
-            record, _created = GmailProcessedMessage.objects.get_or_create(
-                user=request.user, message_id=item["id"]
-            )
-            record.parser_version = PARSER_VERSION
-            record.save(update_fields=["parser_version"])
-            if hint:
-                hints.append(hint)
-                bodies.append(item.get("body") or "")
-                dates.append(_mail_date(item.get("date") or ""))
-        result = apply_mail_hints(request.user, hints)
-        sheet_result = None
         sheet_id = account.spreadsheet_id or request.session.get("spreadsheet_id") or getattr(settings, "GOOGLE_SHEET_ID", "")
+        counts = _process_gmail_items(request.user, creds, raw_messages, sheet_id)
         if sheet_id:
-            sheet_hints = [
-                hint_from_mail(
-                    hint.company,
-                    hint.title,
-                    hint.status,
-                    hint.note,
-                    body,
-                    date_applied,
-                    hint.thread_id,
-                )
-                for hint, body, date_applied in zip(hints, bodies, dates)
-            ]
-            sheet_hints.extend(_local_opportunity_hints(request.user))
-            try:
-                sheet_result = push_hints(creds, sheet_id, sheet_hints)
-                account.spreadsheet_id = sheet_id
-            except Exception as exc:  # noqa: BLE001
-                messages.error(request, f"Recheck read worked, but the Google Sheet update failed ({exc}).")
+            account.spreadsheet_id = sheet_id
         account.last_synced_at = timezone.now()
         account.save(update_fields=["token_json", "last_synced_at", "spreadsheet_id"])
         extra = ""
-        if sheet_result:
-            extra = f" Google Sheet: added {sheet_result['created']}, updated {sheet_result['updated']}."
-        leftover = GmailProcessedMessage.objects.filter(
-            user=request.user, parser_version__lt=PARSER_VERSION
-        ).count()
+        if counts.get("sheet"):
+            extra = f" Google Sheet: added {counts['sheet']['created']}, updated {counts['sheet']['updated']}."
+        leftover = len(_stale_message_ids(request.user, limit=1000))
         more = f" {leftover} older emails still queued — click Recheck again." if leftover else " All scraped emails have been rechecked."
         messages.success(
             request,
-            f"Rechecked {len(raw_messages)} scraped emails. Updated {result['updated']}, added {result['created']}.{extra}{more}",
+            f"Rechecked {len(raw_messages)} scraped emails. Added {counts['created']}, updated {counts['updated']}, "
+            f"review {counts['review']}, failed {counts['failed']}.{extra}{more}",
         )
         return redirect("home")
 
@@ -1139,6 +1173,15 @@ def _local_opportunity_hints(user):
             )
         )
     return hints
+
+
+def _mail_timestamp(raw: str) -> float:
+    from email.utils import parsedate_to_datetime
+
+    try:
+        return parsedate_to_datetime(raw).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
 
 
 def _mail_date(raw: str) -> str:

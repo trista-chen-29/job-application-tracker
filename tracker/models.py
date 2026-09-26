@@ -474,7 +474,14 @@ class GmailAccount(TimeStampedModel):
 class GmailProcessedMessage(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="gmail_messages")
     message_id = models.CharField(max_length=128)
+    thread_id = models.CharField(max_length=128, blank=True)
+    subject = models.CharField(max_length=300, blank=True)
     parser_version = models.PositiveSmallIntegerField(default=0)
+    parse_status = models.CharField(max_length=20, blank=True)
+    application_key = models.CharField(max_length=300, blank=True)
+    tab = models.CharField(max_length=40, blank=True)
+    last_error = models.TextField(blank=True)
+    synced_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
