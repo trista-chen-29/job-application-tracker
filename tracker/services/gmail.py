@@ -116,13 +116,24 @@ def _decode_parts(payload: dict) -> str:
     walk(payload)
     plain_text = "\n".join(plain).strip()
     html_text = _html_to_text("\n".join(html)).strip()
-    if len(plain_text) >= 80:
+    if len(plain_text) >= 80 and _body_has_specific_role(plain_text):
         combined = plain_text
-        if "position of" not in plain_text.lower() and "position of" in html_text.lower():
-            combined = f"{plain_text}\n{html_text}"
+    elif _body_has_specific_role(html_text) and not _body_has_specific_role(plain_text):
+        combined = html_text if len(plain_text) < 80 else f"{plain_text}\n{html_text}"
+    elif len(plain_text) >= 80:
+        combined = plain_text
     else:
         combined = "\n".join(part for part in (plain_text, html_text) if part)
     return combined[:20000]
+
+
+def _body_has_specific_role(text: str) -> bool:
+    if not text:
+        return False
+    from tracker.services.extract import clean_role_title, infer_raw_role, is_generic_role
+
+    role = clean_role_title(infer_raw_role("", text))
+    return bool(role) and not is_generic_role(role)
 
 
 def _is_rate_limit(exc) -> bool:

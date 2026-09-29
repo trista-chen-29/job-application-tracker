@@ -18,9 +18,15 @@ Result values: Applied, Rejected, OA, Interview, Offer. Season values: Winter 20
 3. Delete any stub code. Copy [`Code.gs`](Code.gs) and [`appsscript.json`](appsscript.json) from this folder into the script project.
 4. Save, go back to the sheet, reload.
 5. Menu **Tracker → Sync Gmail now**. Approve Gmail (read-only) and this spreadsheet.
-That first sync also turns on **auto-sync**: Gmail is checked every 10 minutes (`CONFIG.syncEveryMinutes`), even when the sheet is closed. New applications, OAs, and rejections show up on their own.
+That first sync also turns on **auto-sync**. Opening or reloading the sheet runs an installable on-open trigger, which is allowed to read Gmail. A simple `onOpen` only draws the menu and cannot. The same setup keeps a backup check every 10 minutes (`CONFIG.syncEveryMinutes`) while the sheet is closed.
 
-Use **Tracker → Sync Gmail now** anytime you want an immediate pass. **Tracker → Turn off auto-sync** stops the timed runs (a manual sync will not turn it back on); **Turn on auto-sync** resumes them.
+Use **Tracker → Sync Gmail now** anytime you want an immediate pass. **Tracker → Turn off auto-sync** removes both the on-open sync and the 10-minute sync. A manual sync does not turn them back on. **Turn on auto-sync** creates both again.
+
+### Authorization
+
+1. In the Apps Script editor, select `installTracker` and click **Run** once.
+2. Approve the prompts for Gmail (read-only), this spreadsheet, and Apps Script triggers. The installable on-open trigger cannot read Gmail until this authorization exists.
+3. Reload the spreadsheet. The **Tracker** menu appears, and Gmail sync starts. If the menu is missing, confirm `appsscript.json` includes `https://www.googleapis.com/auth/script.container.ui`, then run `installTracker` again.
 
 ## What it does / skips
 
@@ -33,7 +39,7 @@ Use **Tracker → Sync Gmail now** anytime you want an immediate pass. **Tracker
 - After every sync, both tabs are sorted by **Date Applied**, earliest first. Rows with a company but no date go after the dated rows, and blank rows stay at the bottom. Whole rows move, so highlights and dropdowns stay with their row. **Tracker → Sort by Date Applied** does the same on demand, for example after you type a row by hand.
 - Missing locations stay blank, are highlighted yellow, and are listed in the sync toast. A later email with a real location fills the cell and clears the highlight.
 - A missing Role is left blank and highlighted light blue (`CONFIG.roleMissingColor`) so you can fill it in by hand.
-- Company comes from the sender name (`Acme Talent Team`, `Workday Acme`, `Acme @ icims`), then phrases like "applying to X" / "role at X", then the email signature, then the sender domain. Job platforms (Greenhouse, Workday, Ashby, iCIMS, …) and recruiter personal names are never used as the company.
+- Company comes from an explicit line such as "applying to Databricks" before the sender name. Greenhouse, Lever, Workday, and labels like "Talent Team" or "via Greenhouse" are never the company. A sender name is used only when the mail does not name the company, then the email signature, then the sender domain.
 - Your own replies (mail from gmail.com and similar) and newsletters/job alerts are ignored. Companies listed in `CONFIG.ignoreCompanies` (for example on-campus student jobs) are never added.
 - Result only moves forward: Applied → OA → Interview → Offer, with Rejected allowed from any step except Offer. Polite lines such as "unfortunately we can't reply to everyone" in a confirmation do not count as a rejection.
 - Role titles drop job IDs, seasons (the Season column holds that), and a trailing city.
@@ -45,4 +51,5 @@ Use **Tracker → Sync Gmail now** anytime you want an immediate pass. **Tracker
 - A lock keeps a timed run and a menu click from writing at the same time, so they cannot add the same row twice.
 - Date Applied comes only from the confirmation email. Follow-up mail without a role never moves a row between tabs.
 - No **Tracker** menu after reload? In the Apps Script editor, choose `installTracker` in the function dropdown and click **Run** once.
-- Parser version is 10. Bump it in `Code.gs` whenever parse or merge behavior changes.
+- Rows match on normalized company + role + season. The same role in two seasons stays two rows. Reprocessing a message repairs the row it wrote last time instead of adding a duplicate, and it does not overwrite a location, note, or Result you already filled in.
+- Parser version is 11. Bump it in `Code.gs` whenever parse or merge behavior changes. `node sheets-addon/parse_check.js` runs the Apps Script parser against the Databricks example.

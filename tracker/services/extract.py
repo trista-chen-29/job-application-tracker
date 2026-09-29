@@ -36,10 +36,6 @@ PLATFORM_COMPANIES = {
     "ashbyhq",
     "greenhouse-mail",
 }
-US_STATES = (
-    "AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|"
-    "OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY"
-)
 PERSONAL_SENDER_RE = re.compile(
     r"@(?:gmail|googlemail|yahoo|hotmail|outlook|live|icloud|me|aol|proton(?:mail)?)\.[a-z.]+>?\s*$", re.I
 )
@@ -175,6 +171,12 @@ def clean_company(name: str) -> str:
     text = re.sub(r"[\"“”]", "", text)
     text = re.sub(r"\s*@\s*icims\b.*$", "", text, flags=re.I)
     text = re.sub(
+        r"\s+via\s+(?:greenhouse(?:\s+mail)?|lever|workday|ashby|icims|smartrecruiters|taleo|workable|linkedin|indeed)\b.*$",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
         r"^(?:\s*(?:workday[\s_-]*no[\s_-]*reply|workday|do[\s_-]*not[\s_-]*reply|no[\s_-]*reply|noreply)\b)+",
         "",
         text,
@@ -198,7 +200,7 @@ def clean_company(name: str) -> str:
     lower = text.lower()
     if not text or len(text) > 60 or len(text.split()) > 6 or "@" in text:
         return ""
-    if lower in PLATFORM_COMPANIES:
+    if lower in PLATFORM_COMPANIES or lower in GENERIC_SENDER_NAMES:
         return ""
     if re.match(r"(?:the|our|a|an|one|this|joining|being|your|my|dear|hi|hello|candidate|campus)\b", text, re.I):
         return ""
@@ -241,36 +243,76 @@ def company_from_candidate(raw: str) -> str:
     return clean_company(text)
 
 
-def infer_company(from_header: str, subject: str, body: str) -> str:
-    from_name = company_from_sender(from_header)
-    if from_name:
-        return from_name
+EXPLICIT_COMPANY_PATTERNS = (
+    ("subject", re.compile(r"offer of employment\s*[-–:]\s*(.+?)\s+[-–]\s", re.I)),
+    ("both", re.compile(r"^(.+?)\s+invited you to take\b", re.I | re.M)),
+    ("subject", re.compile(r"^(.+?)\s+[-–]\s+thank you\b", re.I)),
+    ("subject", re.compile(r"\b(?:applying|applied|application|apply)\s+(?:to|at|with)\s+([^\n]{2,120})", re.I)),
+    ("body", re.compile(r"\b(?:applying|applied|application|apply)\s+(?:to|at|with)\s+([^\n]{2,120})", re.I)),
+    ("body", re.compile(r"\b(?:role|position|opportunity|opening|job)\s+(?:here\s+)?(?:at|with)\s+([^\n]{2,80})", re.I)),
+    ("body", re.compile(r"\b(?:role|position) of\s+[^\n]+?\s+at\s+([^\n]{2,80})", re.I)),
+)
+WEAK_COMPANY_PATTERNS = (
+    ("body", re.compile(r"\binterest in\s+([^\n]{2,80})", re.I)),
+    ("body", re.compile(r"\bjoining\s+(?:the\s+)?([^\n]{2,60})", re.I)),
+    ("body", re.compile(r"\bcareer with\s+([^\n]{2,60})", re.I)),
+    (
+        "body",
+        re.compile(r"(?:^|\n)\s*([A-Z][\w&.' -]{1,40}?)\s+(?:talent acquisition|human resources|recruiting|recruitment|hiring)\b"),
+    ),
+)
+GENERIC_SENDER_NAMES = {
+    "talent",
+    "recruiting",
+    "recruitment",
+    "notifications",
+    "notification",
+    "careers",
+    "career",
+    "hiring",
+    "jobs",
+    "hr",
+    "noreply",
+    "no reply",
+    "do not reply",
+    "mail",
+    "email",
+}
+
+
+def company_from_patterns(subject: str, body: str, patterns) -> str:
     head = str(body or "")[:3000]
-    patterns = [
-        (subject, re.compile(r"offer of employment\s*[-–:]\s*(.+?)\s+[-–]\s", re.I)),
-        (f"{subject}\n{head}", re.compile(r"^(.+?)\s+invited you to take\b", re.I | re.M)),
-        (subject, re.compile(r"^(.+?)\s+[-–]\s+thank you\b", re.I)),
-        (subject, re.compile(r"\b(?:applying|applied|application|apply)\s+(?:to|at|with)\s+([^\n]{2,120})", re.I)),
-        (head, re.compile(r"\b(?:applying|applied|application|apply)\s+(?:to|at|with)\s+([^\n]{2,120})", re.I)),
-        (head, re.compile(r"\b(?:role|position|opportunity|opening|job)\s+(?:here\s+)?(?:at|with)\s+([^\n]{2,80})", re.I)),
-        (head, re.compile(r"\b(?:role|position) of\s+[^\n]+?\s+at\s+([^\n]{2,80})", re.I)),
-        (head, re.compile(r"\binterest in\s+([^\n]{2,80})", re.I)),
-        (head, re.compile(r"\bjoining\s+(?:the\s+)?([^\n]{2,60})", re.I)),
-        (head, re.compile(r"\bcareer with\s+([^\n]{2,60})", re.I)),
-        (
-            head,
-            re.compile(
-                r"(?:^|\n)\s*([A-Z][\w&.' -]{1,40}?)\s+(?:talent acquisition|human resources|recruiting|recruitment|hiring)\b"
-            ),
-        ),
-    ]
-    for text, pattern in patterns:
+    for source, pattern in patterns:
+        if source == "subject":
+            text = subject
+        elif source == "both":
+            text = f"{subject}\n{head}"
+        else:
+            text = head
         match = pattern.search(str(text or ""))
         if not match:
             continue
         company = company_from_candidate(match.group(1))
         if company:
             return company
+    return ""
+
+
+def infer_company(from_header: str, subject: str, body: str, alt_body: str = "") -> str:
+    # "Thank you for applying to Databricks" beats a Greenhouse or "Talent Team" sender.
+    explicit = company_from_patterns(subject, body, EXPLICIT_COMPANY_PATTERNS) or company_from_patterns(
+        subject, alt_body, EXPLICIT_COMPANY_PATTERNS
+    )
+    if explicit:
+        return explicit
+    from_name = company_from_sender(from_header)
+    if from_name:
+        return from_name
+    weak = company_from_patterns(subject, body, WEAK_COMPANY_PATTERNS) or company_from_patterns(
+        subject, alt_body, WEAK_COMPANY_PATTERNS
+    )
+    if weak:
+        return weak
     workday = re.search(r"([a-z0-9]+)@myworkday\.com", str(from_header or ""), re.I)
     if workday:
         return clean_company(workday.group(1))
@@ -331,14 +373,17 @@ ROLE_PATTERNS = [
 
 
 def infer_raw_role(subject: str, body: str) -> str:
-    # Plain-text mail wraps long lines, which can split a role title in two.
-    texts = {"s": str(subject or ""), "b": re.sub(r"\s*\n\s*", " ", str(body or "")[:4000])}
+    # Try the original line breaks first. Flatten only if a wrapped title was split in two.
+    raw_body = str(body or "")[:4000]
+    flat_body = re.sub(r"\s*\n\s*", " ", raw_body)
+    texts = {"s": [str(subject or "")], "b": [raw_body] if raw_body == flat_body else [raw_body, flat_body]}
     for where, pattern in ROLE_PATTERNS:
         for key in where:
-            for match in pattern.finditer(texts[key]):
-                raw = match.group(1).strip()
-                if is_valid_role(raw):
-                    return raw
+            for text in texts[key]:
+                for match in pattern.finditer(text):
+                    raw = match.group(1).strip()
+                    if is_valid_role(raw):
+                        return raw
     return ""
 
 
@@ -347,6 +392,9 @@ def is_valid_role(raw: str) -> bool:
     if len(role) < 3 or len(role) > 150:
         return False
     if not ROLE_WORDS_RE.search(role):
+        return False
+    # "Role" or "Internship" is not the job title. Keep looking.
+    if is_generic_role(role):
         return False
     return not re.search(r"\b(?:thank|application|applying|your|we|you)\b", role, re.I)
 
@@ -394,9 +442,10 @@ def find_season(text: str, loose: bool) -> str:
         return f"{_season_name(reverse.group(2))} {reverse.group(1)}"
     if not loose:
         return ""
-    season = re.search(r"\b(summer|winter|fall|autumn|spring)\b", blob, re.I)
-    year = re.search(r"\b(20\d{2})\b", blob)
-    return f"{_season_name(season.group(1))} {year.group(1)}" if season and year else ""
+    # "(2027 Start) - Winter" states both pieces. A season word plus an unrelated year does not.
+    start = re.search(r"\((20\d{2})\s*start\)", blob, re.I)
+    season_word = re.search(r"\b(summer|winter|fall|autumn|spring)\b", blob, re.I)
+    return f"{_season_name(season_word.group(1))} {start.group(1)}" if start and season_word else ""
 
 
 def pick_season(raw_role: str, subject: str, body: str) -> str:
@@ -418,10 +467,7 @@ def infer_location(body: str) -> str:
     if labeled:
         return labeled.group(1).strip()
     placed = re.search(r"\b(?:based in|located in|office in)\s+([A-Z][A-Za-z .]+,\s*[A-Z]{2})\b", text)
-    if placed:
-        return placed.group(1).strip()
-    city = re.search(r"\b(?:in|at)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+){0,2},\s*(?:" + US_STATES + r"))\b", text)
-    return city.group(1).strip() if city else ""
+    return placed.group(1).strip() if placed else ""
 
 
 def extract_please_note(body: str) -> str:
@@ -455,16 +501,18 @@ def choose_tab(role: str, text: str = "") -> str:
         return INTERNSHIPS_TAB
     if NEWGRAD_RE.search(title):
         return NEWGRAD_TAB
-    blob = str(text or "")[:2500]
+    # A real title such as "Software Engineer" is new-grad. A footer that mentions interns does not move it.
+    if title and not is_generic_role(title):
+        return NEWGRAD_TAB
+    blob = str(text or "")[:500]
     intern = bool(INTERN_RE.search(blob))
-    grad = bool(NEWGRAD_RE.search(blob) or NEWGRAD_RE.search(title))
+    grad = bool(NEWGRAD_RE.search(blob))
     if intern and not grad:
         return INTERNSHIPS_TAB
     if grad:
         return NEWGRAD_TAB
-    if intern:
-        return INTERNSHIPS_TAB
-    return NEWGRAD_TAB
+    # No role and no intern/new-grad words: do not assume new-grad.
+    return INTERNSHIPS_TAB
 
 
 def tab_from_role(role: str) -> str:

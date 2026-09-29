@@ -12,7 +12,7 @@ const CONFIG = {
   newgradAliases: ['newgrad', 'newgrads', 'new grades', 'new grade', 'new grad', 'new-grad'],
   logTab: '_gmail_log',
   lookbackDays: 730,
-  parserVersion: 10,
+  parserVersion: 11,
   recheckBatch: 30,
   maxThreads: 2000,
   // Apps Script stops a run at 6 minutes; leave time to write the log and toast.
@@ -116,13 +116,28 @@ function deleteTriggers(handler) {
 
 function installAutoSync() {
   deleteTriggers('syncGmail');
+  deleteTriggers('syncOnOpen');
+  const book = SpreadsheetApp.getActive();
   ScriptApp.newTrigger('syncGmail').timeBased().everyMinutes(CONFIG.syncEveryMinutes).create();
+  // A simple onOpen cannot read Gmail. This installable trigger can, after installTracker is authorized.
+  ScriptApp.newTrigger('syncOnOpen').forSpreadsheet(book).onOpen().create();
   PropertiesService.getDocumentProperties().deleteProperty('autoSyncOff');
-  notify('Auto-sync is on: Gmail is checked every ' + CONFIG.syncEveryMinutes + ' minutes, even with the sheet closed.', 'Tracker');
+  notify(
+    'Auto-sync is on. Opening the sheet syncs Gmail, and it is checked every ' + CONFIG.syncEveryMinutes + ' minutes with the sheet closed.',
+    'Tracker'
+  );
+}
+
+// Installable on-open handler. Do not call Gmail from the simple onOpen above.
+function syncOnOpen() {
+  addTrackerMenu();
+  if (PropertiesService.getDocumentProperties().getProperty('autoSyncOff') === '1') return;
+  syncGmail();
 }
 
 function stopAutoSync() {
   deleteTriggers('syncGmail');
+  deleteTriggers('syncOnOpen');
   PropertiesService.getDocumentProperties().setProperty('autoSyncOff', '1');
   notify('Auto-sync is off. Use Sync Gmail now, or Turn on auto-sync to resume.', 'Tracker');
 }
@@ -135,8 +150,16 @@ function installHourlySync() {
 function ensureAutoSync() {
   const props = PropertiesService.getDocumentProperties();
   if (props.getProperty('autoSyncOff') === '1') return;
-  const running = ScriptApp.getProjectTriggers().some((trigger) => trigger.getHandlerFunction() === 'syncGmail');
-  if (!running) ScriptApp.newTrigger('syncGmail').timeBased().everyMinutes(CONFIG.syncEveryMinutes).create();
+  const triggers = ScriptApp.getProjectTriggers();
+  const timed = triggers.filter((trigger) => trigger.getHandlerFunction() === 'syncGmail');
+  const opened = triggers.filter((trigger) => trigger.getHandlerFunction() === 'syncOnOpen');
+  timed.slice(1).forEach((trigger) => ScriptApp.deleteTrigger(trigger));
+  opened.slice(1).forEach((trigger) => ScriptApp.deleteTrigger(trigger));
+  if (!timed.length) ScriptApp.newTrigger('syncGmail').timeBased().everyMinutes(CONFIG.syncEveryMinutes).create();
+  if (!opened.length) {
+    const book = SpreadsheetApp.getActive();
+    if (book) ScriptApp.newTrigger('syncOnOpen').forSpreadsheet(book).onOpen().create();
+  }
 }
 
 function notify(text, title) {
@@ -240,6 +263,7 @@ function runGmailSync() {
           subject: message.getSubject() || '',
           parser_version: existing ? Number(existing.parser_version || 0) : 0,
           parse_status: existing ? existing.parse_status : '',
+          application_key: existing ? existing.application_key || '' : '',
           _message: message,
           _time: message.getDate().getTime(),
         });
@@ -312,6 +336,10 @@ function processMessageRecords(records, log, deadline) {
       continue;
     }
     const hint = parseMessage(message);
+    if (hint && record.application_key && record.application_key !== hint.applicationKey) {
+      // Reprocessing repairs the row this message wrote last time instead of adding a second one.
+      hint.previousKey = record.application_key;
+    }
     if (!hint) {
       counts.skipped += 1;
       upsertLog(log, {
@@ -373,10 +401,19 @@ function safeThreadId(message) {
   }
 }
 
+function specificRole(subject, body) {
+  const role = cleanRoleTitle(inferRawRole(subject, body));
+  return role && !isGenericRole(role) ? role : '';
+}
+
 function fullMessageBody(message) {
   const plain = cleanText(message.getPlainBody() || '');
   const html = htmlToText(message.getBody() || '');
-  return plain.length >= 80 ? plain : (plain + '\n' + html).trim();
+  if (!html) return plain;
+  if (!plain || plain.length < 80) return (plain + '\n' + html).trim();
+  // A long plain part can be a flattened disclaimer while the HTML still has the job title.
+  if (!specificRole('', plain) && specificRole('', html)) return html;
+  return plain;
 }
 
 function htmlToText(html) {
@@ -407,20 +444,30 @@ function parseMessage(message) {
   if (PERSONAL_SENDER.test(fromHeader)) return null;
   const subject = cleanText(message.getSubject());
   if (NOISE_SUBJECT.test(subject)) return null;
-  const body = fullMessageBody(message);
-  const status = inferStatus(subject, body);
+  const plain = cleanText(message.getPlainBody() || '');
+  const html = htmlToText(message.getBody() || '');
+  const status = inferStatus(subject, (plain + '\n' + html).slice(0, 8000));
   if (!status) return null;
-  const company = inferCompany(fromHeader, subject, body);
+  const company = inferCompany(fromHeader, subject, plain, html);
   if (!company || isIgnoredCompany(company)) return null;
-  const rawRole = inferRawRole(subject, body);
+  let rawRole = inferRawRole(subject, plain);
+  let roleSource = plain;
+  if (!specificRole(subject, plain) && specificRole(subject, html)) {
+    rawRole = inferRawRole(subject, html);
+    roleSource = html;
+  } else if (!rawRole && html) {
+    rawRole = inferRawRole(subject, html);
+    roleSource = html;
+  }
   const role = cleanRoleTitle(rawRole);
   if (/^student\b/i.test(role)) return null;
-  const location = roleLocation(rawRole) || inferLocation(body);
-  const tab = chooseTab(role, rawRole + '\n' + subject + '\n' + body);
-  const season = tab === CONFIG.internshipsTab ? pickSeason(rawRole, subject, body) : '';
+  const location = roleLocation(rawRole) || inferLocation(roleSource);
+  const tab = chooseTab(role, rawRole + '\n' + subject + '\n' + String(roleSource || '').slice(0, 500));
+  const season = tab === CONFIG.internshipsTab ? pickSeason(rawRole, subject, roleSource) : '';
+  const noteBody = extractPleaseNote(plain) ? plain : html;
   const threadId = safeThreadId(message);
   const sourceUrl = threadId ? 'https://mail.google.com/mail/u/0/#all/' + threadId : '';
-  const usefulNote = extractPleaseNote(body);
+  const usefulNote = extractPleaseNote(noteBody);
   return {
     company: company.slice(0, 200),
     role: role,
@@ -433,7 +480,7 @@ function parseMessage(message) {
     sourceUrl: sourceUrl,
     notes: composeNotes(usefulNote, sourceUrl),
     // Only the confirmation date is the applied date; OA / rejection dates are not.
-    dateApplied: isConfirmation(status, subject, body) ? formatDate(message.getDate()) : '',
+    dateApplied: isConfirmation(status, subject, plain + '\n' + html) ? formatDate(message.getDate()) : '',
     season: season,
     threadId: threadId,
     applicationKey: applicationKey(company, role, season),
@@ -522,36 +569,52 @@ function isConfirmation(status, subject, body) {
   return status === 'OA' && containsAny(blob, APPLIED_PHRASES);
 }
 
-const US_STATES =
-  'AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY';
 const PERSONAL_SENDER = /@(?:gmail|googlemail|yahoo|hotmail|outlook|live|icloud|me|aol|proton(?:mail)?)\.[a-z.]+>?\s*$/i;
 const NOISE_SUBJECT = /verification code|verify your|passcode|registering|registration|webinar|workshop|welcome to .*careers/i;
 const ROLE_WORDS =
   /\b(?:engineer(?:ing)?|developer|intern(?:ship)?s?|co-?op|scientist|analyst|technician|architect|manager|management|research(?:er)?|designer|specialist|associate|grad(?:uate)?|software|sde|swe|devops|firmware|programmer|consultant|administrator|supervisor|assistant)\b/i;
 
-function inferCompany(fromHeader, subject, body) {
-  const fromName = companyFromSender(fromHeader);
-  if (fromName) return fromName;
+function companyFromPatterns(subject, body, patterns) {
   const head = String(body || '').slice(0, 3000);
-  const patterns = [
-    [subject, /offer of employment\s*[-–:]\s*(.+?)\s+[-–]\s/i],
-    [subject + '\n' + head, /^(.+?)\s+invited you to take\b/im],
-    [subject, /^(.+?)\s+[-–]\s+thank you\b/i],
-    [subject, /\b(?:applying|applied|application|apply)\s+(?:to|at|with)\s+([^\n]{2,120})/i],
-    [head, /\b(?:applying|applied|application|apply)\s+(?:to|at|with)\s+([^\n]{2,120})/i],
-    [head, /\b(?:role|position|opportunity|opening|job)\s+(?:here\s+)?(?:at|with)\s+([^\n]{2,80})/i],
-    [head, /\b(?:role|position) of\s+[^\n]+?\s+at\s+([^\n]{2,80})/i],
-    [head, /\binterest in\s+([^\n]{2,80})/i],
-    [head, /\bjoining\s+(?:the\s+)?([^\n]{2,60})/i],
-    [head, /\bcareer with\s+([^\n]{2,60})/i],
-    [head, /(?:^|\n)\s*([A-Z][\w&.' -]{1,40}?)\s+(?:talent acquisition|human resources|recruiting|recruitment|hiring)\b/],
-  ];
   for (let i = 0; i < patterns.length; i += 1) {
-    const match = String(patterns[i][0] || '').match(patterns[i][1]);
+    const source = patterns[i][0] === 'subject' ? subject : patterns[i][0] === 'both' ? subject + '\n' + head : head;
+    const match = String(source || '').match(patterns[i][1]);
     if (!match) continue;
     const company = companyFromCandidate(match[1]);
     if (company) return company;
   }
+  return '';
+}
+
+const EXPLICIT_COMPANY_PATTERNS = [
+  ['subject', /offer of employment\s*[-–:]\s*(.+?)\s+[-–]\s/i],
+  ['both', /^(.+?)\s+invited you to take\b/im],
+  ['subject', /^(.+?)\s+[-–]\s+thank you\b/i],
+  ['subject', /\b(?:applying|applied|application|apply)\s+(?:to|at|with)\s+([^\n]{2,120})/i],
+  ['body', /\b(?:applying|applied|application|apply)\s+(?:to|at|with)\s+([^\n]{2,120})/i],
+  ['body', /\b(?:role|position|opportunity|opening|job)\s+(?:here\s+)?(?:at|with)\s+([^\n]{2,80})/i],
+  ['body', /\b(?:role|position) of\s+[^\n]+?\s+at\s+([^\n]{2,80})/i],
+];
+
+const WEAK_COMPANY_PATTERNS = [
+  ['body', /\binterest in\s+([^\n]{2,80})/i],
+  ['body', /\bjoining\s+(?:the\s+)?([^\n]{2,60})/i],
+  ['body', /\bcareer with\s+([^\n]{2,60})/i],
+  ['body', /(?:^|\n)\s*([A-Z][\w&.' -]{1,40}?)\s+(?:talent acquisition|human resources|recruiting|recruitment|hiring)\b/],
+];
+
+function inferCompany(fromHeader, subject, body, altBody) {
+  // "Thank you for applying to Databricks" beats a Greenhouse or "Talent Team" sender.
+  const explicit =
+    companyFromPatterns(subject, body, EXPLICIT_COMPANY_PATTERNS) ||
+    companyFromPatterns(subject, altBody || '', EXPLICIT_COMPANY_PATTERNS);
+  if (explicit) return explicit;
+  const fromName = companyFromSender(fromHeader);
+  if (fromName) return fromName;
+  const weak =
+    companyFromPatterns(subject, body, WEAK_COMPANY_PATTERNS) ||
+    companyFromPatterns(subject, altBody || '', WEAK_COMPANY_PATTERNS);
+  if (weak) return weak;
   const workday = String(fromHeader || '').match(/([a-z0-9]+)@myworkday\.com/i);
   if (workday) return cleanCompany(workday[1]);
   return companyFromDomain(fromHeader);
@@ -605,10 +668,29 @@ function companyFromCandidate(raw) {
   return cleanCompany(text);
 }
 
+const GENERIC_SENDER_NAMES = {
+  talent: true,
+  recruiting: true,
+  recruitment: true,
+  notifications: true,
+  notification: true,
+  careers: true,
+  career: true,
+  hiring: true,
+  jobs: true,
+  hr: true,
+  noreply: true,
+  'no reply': true,
+  'do not reply': true,
+  mail: true,
+  email: true,
+};
+
 function cleanCompany(name) {
   let text = cleanText(name)
     .replace(/["“”]/g, '')
     .replace(/\s*@\s*icims\b.*$/i, '')
+    .replace(/\s+via\s+(?:greenhouse(?:\s+mail)?|lever|workday|ashby|icims|smartrecruiters|taleo|workable|linkedin|indeed)\b.*$/i, '')
     .replace(/^(?:\s*(?:workday[\s_-]*no[\s_-]*reply|workday|do[\s_-]*not[\s_-]*reply|no[\s_-]*reply|noreply)\b)+/i, '')
     .replace(/[_|]+/g, ' ')
     .trim();
@@ -627,7 +709,7 @@ function cleanCompany(name) {
   if (/^[a-z0-9]+$/.test(text)) text = /\d/.test(text) ? text.toUpperCase() : text.charAt(0).toUpperCase() + text.slice(1);
   const lower = text.toLowerCase();
   if (!text || text.length > 60 || text.split(/\s+/).length > 6 || text.indexOf('@') >= 0) return '';
-  if (PLATFORM_COMPANIES[lower]) return '';
+  if (PLATFORM_COMPANIES[lower] || GENERIC_SENDER_NAMES[lower]) return '';
   if (/^(?:the|our|a|an|one|this|joining|being|your|my|dear|hi|hello|candidate|campus)\b/i.test(text)) return '';
   if (ROLE_WORDS.test(text) || /thank|application|applying|campus/i.test(text)) return '';
   return text;
@@ -665,18 +747,23 @@ const ROLE_PATTERNS = [
 ];
 
 function inferRawRole(subject, body) {
-  // Plain-text mail wraps long lines, which can split a role title in two.
-  const texts = { s: String(subject || ''), b: String(body || '').slice(0, 4000).replace(/\s*\n\s*/g, ' ') };
+  // Try the original line breaks first. Flatten only if a wrapped title was split in two.
+  const rawBody = String(body || '').slice(0, 4000);
+  const flatBody = rawBody.replace(/\s*\n\s*/g, ' ');
+  const texts = { s: [String(subject || '')], b: rawBody === flatBody ? [rawBody] : [rawBody, flatBody] };
   for (let i = 0; i < ROLE_PATTERNS.length; i += 1) {
     const where = ROLE_PATTERNS[i][0];
     const pattern = ROLE_PATTERNS[i][1];
     for (let j = 0; j < where.length; j += 1) {
-      pattern.lastIndex = 0;
-      let match;
-      while ((match = pattern.exec(texts[where[j]])) !== null) {
-        const raw = match[1].trim();
-        if (isValidRole(raw)) return raw;
-        if (!pattern.global) break;
+      const options = texts[where[j]] || [];
+      for (let k = 0; k < options.length; k += 1) {
+        pattern.lastIndex = 0;
+        let match;
+        while ((match = pattern.exec(options[k])) !== null) {
+          const raw = match[1].trim();
+          if (isValidRole(raw)) return raw;
+          if (!pattern.global) break;
+        }
       }
     }
   }
@@ -687,6 +774,8 @@ function isValidRole(raw) {
   const role = cleanRoleTitle(raw);
   if (role.length < 3 || role.length > 150) return false;
   if (!ROLE_WORDS.test(role)) return false;
+  // "Role" or "Internship" is not the job title. Keep looking.
+  if (isGenericRole(role)) return false;
   return !/\b(?:thank|application|applying|your|we|you)\b/i.test(role);
 }
 
@@ -742,9 +831,10 @@ function findSeason(text, loose) {
   const reversed = blob.match(/\b(20\d{2})\s+(summer|winter|fall|autumn|spring)\b/i);
   if (reversed) return seasonName(reversed[2]) + ' ' + reversed[1];
   if (!loose) return '';
-  const seasonMatch = blob.match(/\b(summer|winter|fall|autumn|spring)\b/i);
-  const yearMatch = blob.match(/\b(20\d{2})\b/);
-  return seasonMatch && yearMatch ? seasonName(seasonMatch[1]) + ' ' + yearMatch[1] : '';
+  // "(2027 Start) - Winter" states both pieces. A season word plus an unrelated year does not.
+  const start = blob.match(/\((20\d{2})\s*start\)/i);
+  const seasonWord = blob.match(/\b(summer|winter|fall|autumn|spring)\b/i);
+  return start && seasonWord ? seasonName(seasonWord[1]) + ' ' + start[1] : '';
 }
 
 function seasonName(name) {
@@ -786,22 +876,22 @@ function inferLocation(body) {
   const labeled = text.match(/\blocation\s*:\s*([A-Z][A-Za-z .]+,\s*[A-Z]{2}\b|remote|hybrid)/i);
   if (labeled) return labeled[1].trim();
   const placed = text.match(/\b(?:based in|located in|office in)\s+([A-Z][A-Za-z .]+,\s*[A-Z]{2})\b/);
-  if (placed) return placed[1].trim();
-  const city = text.match(new RegExp('\\b(?:in|at)\\s+([A-Z][a-z]+(?:\\s[A-Z][a-z]+){0,2},\\s*(?:' + US_STATES + '))\\b'));
-  return city ? city[1].trim() : '';
+  return placed ? placed[1].trim() : '';
 }
 
 function chooseTab(title, body) {
   const role = String(title || '').trim();
   if (isInternRole(role) && !isGenericRole(role) && !isNewGradRole(role)) return CONFIG.internshipsTab;
   if (isNewGradRole(role)) return CONFIG.newgradTab;
-  const blob = String(body || '').slice(0, 2500);
+  // A real title such as "Software Engineer" is new-grad. A footer that mentions interns does not move it.
+  if (role && !isGenericRole(role)) return CONFIG.newgradTab;
+  const blob = String(body || '').slice(0, 500);
   const intern = isInternRole(blob);
-  const grad = isNewGradRole(blob) || isNewGradRole(role);
+  const grad = isNewGradRole(blob);
   if (intern && !grad) return CONFIG.internshipsTab;
   if (grad) return CONFIG.newgradTab;
-  if (intern) return CONFIG.internshipsTab;
-  return CONFIG.newgradTab;
+  // No role and no intern/new-grad words: do not assume new-grad.
+  return CONFIG.internshipsTab;
 }
 
 function tabFromRole(role) {
@@ -867,21 +957,24 @@ function applyHint(hint) {
   if (!intended) return 'skipped';
   const match = findApplicationMatch(hint);
   if (match.status === 'review') return 'review';
+  if (match.repair) hint.repair = true;
+  let action = 'created';
   if (match.status === 'move') {
     const destCols = headerMap(intended);
     const destRow = placeNewRow(intended, destCols);
     copyMergedRow(intended, destRow, destCols, hint, match.values, match.cols);
     clearTrackerRow(match.sheet, match.row, match.cols);
-    return 'updated';
+    action = 'updated';
+  } else if (match.status === 'update') {
+    action = mergeIntoRow(match.sheet, match.row, match.cols, match.values, hint);
+  } else {
+    const cols = headerMap(intended);
+    if (cols.company < 0 || cols.result < 0) return 'skipped';
+    const destRow = placeNewRow(intended, cols);
+    copyMergedRow(intended, destRow, cols, hint, null, cols);
   }
-  if (match.status === 'update') {
-    return mergeIntoRow(match.sheet, match.row, match.cols, match.values, hint);
-  }
-  const cols = headerMap(intended);
-  if (cols.company < 0 || cols.result < 0) return 'skipped';
-  const destRow = placeNewRow(intended, cols);
-  copyMergedRow(intended, destRow, cols, hint, null, cols);
-  return 'created';
+  if (match.clearStale) clearTrackerRow(match.clearStale.sheet, match.clearStale.row, match.clearStale.cols);
+  return action;
 }
 
 function findApplicationMatch(hint) {
@@ -890,6 +983,7 @@ function findApplicationMatch(hint) {
   const companyHits = [];
   const roleHits = [];
   const keyHits = [];
+  const repairHits = [];
   tabs.forEach((tabName) => {
     if (!tabName || seen[tabName]) return;
     seen[tabName] = true;
@@ -901,12 +995,20 @@ function findApplicationMatch(hint) {
     const width = Math.max(sheet.getLastColumn(), 1);
     const values = sheet.getRange(1, 1, last, width).getDisplayValues();
     for (let i = 1; i < values.length; i += 1) {
-      if (!companiesMatch(values[i][cols.company], hint.company)) continue;
       const role = cols.role >= 0 ? String(values[i][cols.role] || '') : '';
       const season = cols.season >= 0 ? String(values[i][cols.season] || '') : '';
       const hit = { sheet, row: i + 1, cols, values: values[i], tab: tabName };
+      if (hint.previousKey && applicationKey(values[i][cols.company], role, season) === hint.previousKey) {
+        repairHits.push(hit);
+      }
+      if (!companiesMatch(values[i][cols.company], hint.company)) continue;
       companyHits.push(hit);
-      if (hint.role && !isGenericRole(hint.role) && normalizeCompany(role) === normalizeCompany(hint.role)) {
+      if (
+        hint.role &&
+        !isGenericRole(hint.role) &&
+        normalizeCompany(role) === normalizeCompany(hint.role) &&
+        seasonsCompatible(season, hint.season)
+      ) {
         roleHits.push(hit);
       }
       if (applicationKey(hint.company, hint.role, hint.season) === applicationKey(values[i][cols.company], role, season)) {
@@ -917,11 +1019,12 @@ function findApplicationMatch(hint) {
   // Follow-up mail without a role cannot say which tab is right, so it never moves a row.
   const place = (hit) =>
     Object.assign({ status: hit.tab === hint.tab || tabFromRole(hint.role) !== hint.tab ? 'update' : 'move' }, hit);
-  if (keyHits.length === 1) return place(keyHits[0]);
-  if (keyHits.length > 1) return { status: 'review' };
-  if (roleHits.length === 1) return place(roleHits[0]);
-  if (roleHits.length > 1) return { status: 'review' };
-  if (companyHits.length === 1) {
+  let chosen;
+  if (keyHits.length === 1) chosen = place(keyHits[0]);
+  else if (keyHits.length > 1) chosen = { status: 'review' };
+  else if (roleHits.length === 1) chosen = place(roleHits[0]);
+  else if (roleHits.length > 1) chosen = { status: 'review' };
+  else if (companyHits.length === 1 && seasonsCompatible(seasonOfHit(companyHits[0]), hint.season)) {
     const currentRole = companyHits[0].cols.role >= 0 ? String(companyHits[0].values[companyHits[0].cols.role] || '') : '';
     // OA / interview / offer / rejection mail is about an application you already have, even if it words the role differently.
     if (
@@ -930,12 +1033,29 @@ function findApplicationMatch(hint) {
       normalizeCompany(currentRole) === normalizeCompany(hint.role) ||
       (hint.result !== 'Applied' && rolesSimilar(currentRole, hint.role))
     ) {
-      return place(companyHits[0]);
-    }
-    return { status: 'create' };
+      chosen = place(companyHits[0]);
+    } else chosen = { status: 'create' };
+  } else if (companyHits.length > 1 && isGenericRole(hint.role)) chosen = { status: 'review' };
+  else chosen = { status: 'create' };
+  if (hint.previousKey && repairHits.length === 1 && chosen.status !== 'review') {
+    const repair = repairHits[0];
+    const same = chosen.sheet === repair.sheet && chosen.row === repair.row;
+    if (chosen.status === 'create') return Object.assign(place(repair), { repair: true });
+    if (!same && (chosen.status === 'update' || chosen.status === 'move')) chosen.clearStale = repair;
+    if (same) chosen.repair = true;
   }
-  if (companyHits.length > 1 && isGenericRole(hint.role)) return { status: 'review' };
-  return { status: 'create' };
+  return chosen;
+}
+
+function seasonOfHit(hit) {
+  return hit.cols.season >= 0 ? String(hit.values[hit.cols.season] || '') : '';
+}
+
+function seasonsCompatible(rowSeason, hintSeason) {
+  const row = normalizeCompany(rowSeason);
+  const hint = normalizeCompany(hintSeason);
+  if (!row || !hint) return true;
+  return row === hint;
 }
 
 function placeNewRow(sheet, cols) {
@@ -978,6 +1098,7 @@ function copyMergedRow(sheet, row, cols, hint, existingValues, existingCols) {
 function mergeIntoRow(sheet, row, cols, existing, hint) {
   let changed = false;
   const currentDate = cellValue(existing, cols.date);
+  const currentCompany = cellValue(existing, cols.company);
   const currentRole = cellValue(existing, cols.role);
   const currentLoc = cellValue(existing, cols.location);
   const currentSeason = cellValue(existing, cols.season);
@@ -987,7 +1108,20 @@ function mergeIntoRow(sheet, row, cols, existing, hint) {
     writeCell(sheet, row, cols.date, hint.dateApplied);
     changed = true;
   }
-  if (cols.role >= 0 && hint.role && (isPlaceholder(currentRole) || roleShouldReplace(currentRole, hint.role))) {
+  if (
+    cols.company >= 0 &&
+    hint.company &&
+    normalizeCompany(currentCompany) !== normalizeCompany(hint.company) &&
+    (hint.repair || companyShouldReplace(currentCompany, hint.company))
+  ) {
+    writeCell(sheet, row, cols.company, hint.company);
+    changed = true;
+  }
+  const replaceRole =
+    (hint.repair && hint.role && !isGenericRole(hint.role)) ||
+    isPlaceholder(currentRole) ||
+    roleShouldReplace(currentRole, hint.role);
+  if (cols.role >= 0 && hint.role && replaceRole) {
     writeFlagged(sheet, row, cols.role, hint.role, CONFIG.roleMissingColor);
     changed = true;
   } else if (cols.role >= 0 && !currentRole) {
@@ -1001,7 +1135,7 @@ function mergeIntoRow(sheet, row, cols, existing, hint) {
       writeFlagged(sheet, row, cols.location, '', CONFIG.locationMissingColor);
     }
   }
-  if (cols.season >= 0 && hint.season && (!currentSeason || isPlaceholder(currentSeason))) {
+  if (cols.season >= 0 && hint.season && (hint.repair || !currentSeason || isPlaceholder(currentSeason))) {
     writeCell(sheet, row, cols.season, hint.season);
     changed = true;
   }
@@ -1245,6 +1379,15 @@ function rolesSimilar(a, b) {
   const shared = left.filter((word) => right.indexOf(word) >= 0).length;
   const union = left.length + right.length - shared;
   return shared / union >= 0.5;
+}
+
+function companyShouldReplace(current, next) {
+  const now = String(current || '').trim();
+  const nxt = String(next || '').trim();
+  if (!nxt || !now) return false;
+  if (normalizeCompany(now) === normalizeCompany(nxt)) return false;
+  // "Databricks via Greenhouse" is the platform label, not a name you typed.
+  return /\bvia\b/i.test(now) && normalizeCompany(now).indexOf(normalizeCompany(nxt) + ' ') === 0;
 }
 
 function companiesMatch(a, b) {

@@ -35,6 +35,7 @@ class MailHint:
     useful_note: str = ""
     application_key: str = ""
     tab: str = ""
+    previous_key: str = ""
 
 
 def gmail_url_from_thread(thread_id: str) -> str:
@@ -116,7 +117,7 @@ def _norm_company(name: str) -> str:
     return text
 
 
-PARSER_VERSION = 10
+PARSER_VERSION = 11
 
 
 def to_sheet_hint(hint: MailHint):
@@ -135,6 +136,7 @@ def to_sheet_hint(hint: MailHint):
         source_url=hint.source_url,
         useful_note=hint.useful_note,
         application_key=hint.application_key or application_key(hint.company, hint.title, hint.season),
+        previous_key=hint.previous_key,
     )
 
 
@@ -205,7 +207,9 @@ def apply_mail_hints(user, hints: list[MailHint]) -> dict:
         existing, action = _match_opportunity(user, hint.company, hint.title, hint.status)
         if action == "review":
             review += 1
+            hint.disposition = "review"
             continue
+        hint.disposition = "applied"
         if existing:
             fields_changed = False
             if _title_is_better(existing.title, hint.title):

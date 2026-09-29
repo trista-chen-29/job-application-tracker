@@ -1027,6 +1027,13 @@ def _process_gmail_items(user, creds, items, sheet_id: str) -> dict:
                 last_error="",
             )
             continue
+        previous = (
+            GmailProcessedMessage.objects.filter(user=user, message_id=item.get("id") or "")
+            .values_list("application_key", flat=True)
+            .first()
+        )
+        if previous and previous != hint.application_key:
+            hint.previous_key = previous
         hints.append(hint)
     local = apply_mail_hints(user, hints) if hints else {"created": 0, "updated": 0, "skipped": 0, "review": 0}
     for key in ("created", "updated", "skipped", "review"):
@@ -1052,7 +1059,7 @@ def _process_gmail_items(user, creds, items, sheet_id: str) -> dict:
                 )
             return counts
     for hint in hints:
-        status = "review" if local.get("review") and False else "applied"
+        status = "review" if getattr(hint, "disposition", "") == "review" else "applied"
         _save_gmail_log(
             user,
             hint.source_id,
