@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Django tests
+        env:
+          DJANGO_SECRET_KEY: ci-only-not-a-secret
+          DJANGO_DEBUG: "false"
+          DATABASE_URL: ""
+        run: python manage.py test tracker.tests
+
+      - name: Check the sheet parser
+        run: node sheets-addon/parse_check.js
