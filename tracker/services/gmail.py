@@ -160,7 +160,7 @@ def _gmail_execute(request, pause_seconds: float = 0.0):
     raise last_error
 
 
-def fetch_job_messages(creds, newer_than_days: int = 730, limit: int = 40, skip_ids: set[str] | None = None) -> list[dict]:
+def fetch_job_messages(creds, newer_than_days: int = 730, limit: int = 40, skip_ids: set[str] | None = None) -> tuple[list[dict], bool]:
     from googleapiclient.discovery import build
 
     skip_ids = skip_ids or set()
@@ -168,26 +168,32 @@ def fetch_job_messages(creds, newer_than_days: int = 730, limit: int = 40, skip_
     query = GMAIL_QUERY.replace("730d", f"{newer_than_days}d")
     ids: list[dict] = []
     page_token = None
-    while len(ids) < 400:
-        kwargs = {
-            "userId": "me",
-            "q": query,
-            "maxResults": min(100, 400 - len(ids)),
-        }
+    more = False
+    pages = 0
+    while len(ids) < limit and pages < 8:
+        pages += 1
+        kwargs = {"userId": "me", "q": query, "maxResults": min(100, max(limit * 2, 20))}
         if page_token:
             kwargs["pageToken"] = page_token
         try:
-            response = _gmail_execute(service.users().messages().list(**kwargs), pause_seconds=0.4)
+            response = _gmail_execute(service.users().messages().list(**kwargs), pause_seconds=0.2)
         except Exception:
             break
-        ids.extend(response.get("messages") or [])
         page_token = response.get("nextPageToken")
+        for item in response.get("messages") or []:
+            if item["id"] in skip_ids:
+                continue
+            if len(ids) >= limit:
+                more = True
+                break
+            ids.append(item)
+        if len(ids) >= limit and (more or page_token):
+            more = True
+            break
         if not page_token:
             break
     messages = []
     for item in ids:
-        if item["id"] in skip_ids:
-            continue
         try:
             full = _gmail_execute(
                 service.users()
@@ -197,7 +203,7 @@ def fetch_job_messages(creds, newer_than_days: int = 730, limit: int = 40, skip_
                     id=item["id"],
                     format="full",
                 ),
-                pause_seconds=1.3,
+                pause_seconds=0.2,
             )
         except Exception:
             break
@@ -215,7 +221,7 @@ def fetch_job_messages(creds, newer_than_days: int = 730, limit: int = 40, skip_
         )
         if len(messages) >= limit:
             break
-    return messages
+    return messages, more
 
 
 def fetch_messages_by_ids(creds, message_ids: list[str], limit: int = 15) -> list[dict]:

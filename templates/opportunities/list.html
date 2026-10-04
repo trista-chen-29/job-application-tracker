@@ -6,7 +6,7 @@
   <h1>Applications</h1>
   <div class="row actions">
     {% if gmail_account %}
-      <a class="btn" href="{% url 'gmail_sync' %}">Sync Gmail</a>
+      <form method="post" action="{% url 'gmail_sync' %}" style="display:inline">{% csrf_token %}<button class="btn" type="submit">Sync Gmail</button></form>
     {% else %}
       <a class="btn" href="{% url 'gmail_connect' %}">Connect Gmail</a>
     {% endif %}
@@ -44,6 +44,13 @@
   </tbody>
 </table>
 </div>
+{% if opportunities.has_other_pages %}
+<p class="row actions">
+  {% if opportunities.has_previous %}<a class="btn secondary" href="?page={{ opportunities.previous_page_number }}&q={{ q }}&status={{ status }}">Previous</a>{% endif %}
+  <span>Page {{ opportunities.number }} of {{ opportunities.paginator.num_pages }}</span>
+  {% if opportunities.has_next %}<a class="btn secondary" href="?page={{ opportunities.next_page_number }}&q={{ q }}&status={{ status }}">Next</a>{% endif %}
+</p>
+{% endif %}
 {% else %}
   <div class="empty">Nothing on the sheet yet. Connect Gmail to pull recruiter mail, or save a role from Openings.</div>
 {% endif %}

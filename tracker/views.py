@@ -4,6 +4,7 @@ from datetime import datetime
 
 from django.conf import settings
 from django.contrib import messages
+from django.core.paginator import Paginator
 from django.contrib.auth import login
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.db.models import Q
@@ -27,6 +28,7 @@ from tracker.forms import (
     RegisterForm,
     StatusForm,
     TaskForm,
+    InterviewNoteForm,
     TemplateForm,
     TrackForm,
 )
@@ -140,11 +142,12 @@ class OpportunityListView(LoginRequiredMixin, View):
         if status:
             mapped = [key for key, value in SHEET_STATUS_FROM_FULL.items() if value == status]
             qs = qs.filter(status__in=mapped or [status])
+        page = Paginator(qs, 50).get_page(request.GET.get("page") or 1)
         return render(
             request,
             "opportunities/list.html",
             {
-                "opportunities": qs,
+                "opportunities": page,
                 "sheet_statuses": SHEET_STATUSES,
                 "q": q,
                 "status": status,
@@ -864,6 +867,9 @@ class GmailConnectView(LoginRequiredMixin, View):
             sheet_id = request.session["spreadsheet_id"]
         else:
             sheet_id = getattr(settings, "GOOGLE_SHEET_ID", "")
+        held = GmailProcessedMessage.objects.filter(
+            user=request.user, parse_status__in=["review", "parked", "ignored"]
+        ).order_by("-synced_at")[:30]
         return render(
             request,
             "gmail/connect.html",
@@ -872,6 +878,7 @@ class GmailConnectView(LoginRequiredMixin, View):
                 "gmail_ready": gmail_configured(),
                 "spreadsheet_id": sheet_id,
                 "spreadsheet_url": f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit" if sheet_id else "",
+                "held": held,
             },
         )
 
@@ -910,9 +917,7 @@ class GmailConnectView(LoginRequiredMixin, View):
         if not gmail_configured():
             messages.error(request, "Add Google OAuth keys to .env first, or paste emails below.")
             return redirect("gmail_connect")
-        import os
-
-        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+        _allow_insecure_oauth()
         flow = flow_for(request)
         authorization_url, state = flow.authorization_url(
             access_type="offline",
@@ -929,9 +934,7 @@ class GmailCallbackView(LoginRequiredMixin, View):
     def get(self, request):
         if not gmail_configured():
             return redirect("gmail_connect")
-        import os
-
-        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+        _allow_insecure_oauth()
         flow = flow_for(request)
         flow.code_verifier = request.session.get("gmail_code_verifier")
         try:
@@ -949,8 +952,8 @@ class GmailCallbackView(LoginRequiredMixin, View):
                 "spreadsheet_id": sheet_id,
             },
         )
-        messages.success(request, "Gmail connected. Syncing recruiter mail…")
-        return redirect("gmail_sync")
+        messages.success(request, "Gmail connected. Use Sync now to read recruiter mail.")
+        return redirect("gmail_connect")
 
 
 class GmailDisconnectView(LoginRequiredMixin, View):
@@ -965,7 +968,7 @@ def _done_message_ids(user):
         GmailProcessedMessage.objects.filter(
             user=user,
             parser_version__gte=PARSER_VERSION,
-            parse_status__in=["applied", "ignored"],
+            parse_status__in=["applied", "ignored", "parked"],
         ).values_list("message_id", flat=True)
     )
 
@@ -981,8 +984,20 @@ def _stale_message_ids(user, limit: int = 30) -> list[str]:
     )
 
 
+def _allow_insecure_oauth():
+    if settings.DEBUG:
+        import os
+
+        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+
+
 def _save_gmail_log(user, message_id: str, **fields):
-    record, _created = GmailProcessedMessage.objects.get_or_create(user=user, message_id=message_id)
+    record, created = GmailProcessedMessage.objects.get_or_create(user=user, message_id=message_id)
+    status = fields.get("parse_status")
+    if status in {"review", "failed"}:
+        record.fetch_attempts = (0 if created else record.fetch_attempts) + 1
+        if record.fetch_attempts >= 3:
+            fields = {**fields, "parse_status": "parked"}
     for key, value in fields.items():
         setattr(record, key, value)
     record.synced_at = timezone.now()
@@ -1017,6 +1032,11 @@ def _process_gmail_items(user, creds, items, sheet_id: str) -> dict:
             continue
         if not hint:
             counts["skipped"] += 1
+            from tracker.services.extract import skip_reason
+
+            reason = skip_reason(item.get("from") or "", item.get("subject") or "", item.get("body") or "") or "skipped"
+            reasons = counts.setdefault("skipped_reasons", {})
+            reasons[reason] = reasons.get(reason, 0) + 1
             _save_gmail_log(
                 user,
                 item["id"],
@@ -1024,7 +1044,7 @@ def _process_gmail_items(user, creds, items, sheet_id: str) -> dict:
                 subject=item.get("subject") or "",
                 parser_version=PARSER_VERSION,
                 parse_status="ignored",
-                last_error="",
+                last_error=reason,
             )
             continue
         previous = (
@@ -1040,7 +1060,11 @@ def _process_gmail_items(user, creds, items, sheet_id: str) -> dict:
         counts[key] += local.get(key, 0)
     sheet_result = None
     if sheet_id and hints:
-        sheet_hints = [to_sheet_hint(hint) for hint in hints]
+        sheet_hints = [
+            to_sheet_hint(hint)
+            for hint in hints
+            if hint.confidence >= 0.7 and getattr(hint, "disposition", "") != "review"
+        ]
         try:
             sheet_result = push_hints(creds, sheet_id, sheet_hints)
         except Exception as exc:  # noqa: BLE001
@@ -1060,7 +1084,7 @@ def _process_gmail_items(user, creds, items, sheet_id: str) -> dict:
             return counts
     for hint in hints:
         status = "review" if getattr(hint, "disposition", "") == "review" else "applied"
-        _save_gmail_log(
+        saved = _save_gmail_log(
             user,
             hint.source_id,
             thread_id=hint.thread_id,
@@ -1071,15 +1095,14 @@ def _process_gmail_items(user, creds, items, sheet_id: str) -> dict:
             tab=hint.tab,
             last_error="",
         )
+        if saved.parse_status == "parked":
+            counts["parked"] = counts.get("parked", 0) + 1
     if sheet_result:
         counts["sheet"] = sheet_result
     return counts
 
 
 class GmailSyncView(LoginRequiredMixin, View):
-    def get(self, request):
-        return self.post(request)
-
     def post(self, request):
         account = GmailAccount.objects.filter(user=request.user).first()
         if not account:
@@ -1088,7 +1111,7 @@ class GmailSyncView(LoginRequiredMixin, View):
         try:
             creds = refresh_if_needed(credentials_from_json(account.token_json))
             account.token_json = credentials_to_json(creds)
-            raw_messages = fetch_job_messages(creds, skip_ids=_done_message_ids(request.user), limit=25)
+            raw_messages, more_mail = fetch_job_messages(creds, skip_ids=_done_message_ids(request.user), limit=8)
             stale_ids = _stale_message_ids(request.user, limit=20)
             if stale_ids:
                 raw_messages.extend(fetch_messages_by_ids(creds, stale_ids))
@@ -1104,19 +1127,22 @@ class GmailSyncView(LoginRequiredMixin, View):
         extra = ""
         if counts.get("sheet"):
             extra = f" Google Sheet: added {counts['sheet']['created']}, updated {counts['sheet']['updated']}."
+        reasons = counts.get("skipped_reasons") or {}
+        reason_text = ""
+        if reasons:
+            reason_text = " Skipped " + ", ".join(f"{total} {name}" for name, total in reasons.items()) + "."
+        parked = f" Parked {counts['parked']} for review." if counts.get("parked") else ""
+        more = " More mail is waiting — sync again to continue." if more_mail else ""
         messages.success(
             request,
             f"Gmail sync complete. Read {len(raw_messages)} messages. "
             f"Added {counts['created']}, updated {counts['updated']}, skipped {counts['skipped']}, "
-            f"review {counts['review']}, failed {counts['failed']}.{extra}",
+            f"review {counts['review']}, failed {counts['failed']}.{reason_text}{parked}{extra}{more}",
         )
         return redirect("home")
 
 
 class GmailRecheckView(LoginRequiredMixin, View):
-    def get(self, request):
-        return self.post(request)
-
     def post(self, request):
         account = GmailAccount.objects.filter(user=request.user).first()
         if not account:
@@ -1163,6 +1189,7 @@ class GmailRecheckView(LoginRequiredMixin, View):
 
 
 def _local_opportunity_hints(user):
+    from tracker.services.extract import clip_text
     from tracker.services.gsheet import format_applied_date, hint_from_mail
 
     hints = []
@@ -1175,7 +1202,7 @@ def _local_opportunity_hints(user):
                 opp.company,
                 opp.title,
                 opp.status,
-                (opp.notes or "")[:180],
+                clip_text(opp.notes or ""),
                 date_applied=applied,
             )
         )

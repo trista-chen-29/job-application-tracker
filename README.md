@@ -21,7 +21,7 @@ The live tracker is the spreadsheet plugin.
 - Matching is **company + role + season**. Two roles, or the same role in two seasons, stay separate rows. Confirmation mail fills blanks and can replace a machine-written role from an older parse. It does not wipe a location you typed or move Result backwards (Rejected never replaces Offer).
 - **Tracker → Recheck scraped mail** walks stale `_gmail_log` rows in batches of 30. **Reprocess all stale mail** restarts that walk.
 - A message ID in the log is not a permanent skip. Failed writes stay `failed` and are retried. Ignored mail (no company/status) is stored separately from failures.
-- Paste the latest [`sheets-addon/Code.gs`](sheets-addon/Code.gs) after pulling parser changes. The current parser version is **11**.
+- Paste the latest [`sheets-addon/Code.gs`](sheets-addon/Code.gs) after pulling parser changes. The current parser version is **12**.
 - **Sync Gmail now** walks every matching thread (not just the newest 50), oldest first, and stops before the 6-minute Apps Script limit. Auto-sync (every 10 minutes) picks up anything left, then only scans the last 7 days.
 - Rows are kept in **Date Applied** order, earliest first, after every sync. Rows without a date go after dated rows. **Tracker → Sort by Date Applied** re-sorts on demand.
 - Date Applied comes only from the confirmation email. Follow-up mail without a role (OA, rejection) updates the row in whatever tab it is already in.

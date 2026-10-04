@@ -52,4 +52,4 @@ Use **Tracker → Sync Gmail now** anytime you want an immediate pass. **Tracker
 - Date Applied comes only from the confirmation email. Follow-up mail without a role never moves a row between tabs.
 - No **Tracker** menu after reload? In the Apps Script editor, choose `installTracker` in the function dropdown and click **Run** once.
 - Rows match on normalized company + role + season. The same role in two seasons stays two rows. Reprocessing a message repairs the row it wrote last time instead of adding a duplicate, and it does not overwrite a location, note, or Result you already filled in.
-- Parser version is 11. Bump it in `Code.gs` whenever parse or merge behavior changes. `node sheets-addon/parse_check.js` runs the Apps Script parser against the Databricks example.
+- Parser version is 12. Bump it in `Code.gs` whenever parse or merge behavior changes. `node sheets-addon/parse_check.js` runs the Apps Script parser against the Databricks example.

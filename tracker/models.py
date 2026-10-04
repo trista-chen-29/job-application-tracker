@@ -481,6 +481,7 @@ class GmailProcessedMessage(models.Model):
     application_key = models.CharField(max_length=300, blank=True)
     tab = models.CharField(max_length=40, blank=True)
     last_error = models.TextField(blank=True)
+    fetch_attempts = models.PositiveSmallIntegerField(default=0)
     synced_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

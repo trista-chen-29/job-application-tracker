@@ -12,7 +12,7 @@ const CONFIG = {
   newgradAliases: ['newgrad', 'newgrads', 'new grades', 'new grade', 'new grad', 'new-grad'],
   logTab: '_gmail_log',
   lookbackDays: 730,
-  parserVersion: 11,
+  parserVersion: 12,
   recheckBatch: 30,
   maxThreads: 2000,
   // Apps Script stops a run at 6 minutes; leave time to write the log and toast.
@@ -310,7 +310,7 @@ function shouldReprocess(record) {
 }
 
 function processMessageRecords(records, log, deadline) {
-  const counts = { created: 0, updated: 0, skipped: 0, review: 0, failed: 0, remaining: 0 };
+  const counts = { created: 0, updated: 0, skipped: 0, review: 0, failed: 0, remaining: 0, skippedReasons: {} };
   const missingLocations = [];
   for (let index = 0; index < records.length; index += 1) {
     if (deadline && Date.now() > deadline) {
@@ -336,12 +336,9 @@ function processMessageRecords(records, log, deadline) {
       continue;
     }
     const hint = parseMessage(message);
-    if (hint && record.application_key && record.application_key !== hint.applicationKey) {
-      // Reprocessing repairs the row this message wrote last time instead of adding a second one.
-      hint.previousKey = record.application_key;
-    }
-    if (!hint) {
+    if (hint && hint.ignored) {
       counts.skipped += 1;
+      counts.skippedReasons[hint.ignored] = (counts.skippedReasons[hint.ignored] || 0) + 1;
       upsertLog(log, {
         message_id: message.getId(),
         thread_id: safeThreadId(message),
@@ -350,7 +347,26 @@ function processMessageRecords(records, log, deadline) {
         parse_status: 'ignored',
         application_key: '',
         tab: '',
-        last_error: '',
+        last_error: hint.ignored,
+      });
+      continue;
+    }
+    if (hint && record.application_key && record.application_key !== hint.applicationKey) {
+      // Reprocessing repairs the row this message wrote last time instead of adding a second one.
+      hint.previousKey = record.application_key;
+    }
+    if (!hint) {
+      counts.skipped += 1;
+      counts.skippedReasons['no company'] = (counts.skippedReasons['no company'] || 0) + 1;
+      upsertLog(log, {
+        message_id: message.getId(),
+        thread_id: safeThreadId(message),
+        subject: message.getSubject() || '',
+        parser_version: CONFIG.parserVersion,
+        parse_status: 'ignored',
+        application_key: '',
+        tab: '',
+        last_error: 'no company',
       });
       continue;
     }
@@ -441,15 +457,17 @@ function cleanText(text) {
 function parseMessage(message) {
   const fromHeader = String(message.getFrom() || '');
   // Your own replies (and anything from a personal mailbox) are not recruiter mail.
-  if (PERSONAL_SENDER.test(fromHeader)) return null;
+  if (PERSONAL_SENDER.test(fromHeader)) return { ignored: 'personal sender' };
   const subject = cleanText(message.getSubject());
-  if (NOISE_SUBJECT.test(subject)) return null;
+  if (NOISE_SUBJECT.test(subject)) return { ignored: 'not an application' };
   const plain = cleanText(message.getPlainBody() || '');
   const html = htmlToText(message.getBody() || '');
   const status = inferStatus(subject, (plain + '\n' + html).slice(0, 8000));
-  if (!status) return null;
-  const company = inferCompany(fromHeader, subject, plain, html);
-  if (!company || isIgnoredCompany(company)) return null;
+  if (!status) return { ignored: 'no status' };
+  const found = inferCompany(fromHeader, subject, plain, html);
+  const company = found.company;
+  if (isIgnoredCompany(company)) return { ignored: 'ignored company' };
+  if (!company) return { ignored: 'no company' };
   let rawRole = inferRawRole(subject, plain);
   let roleSource = plain;
   if (!specificRole(subject, plain) && specificRole(subject, html)) {
@@ -460,7 +478,7 @@ function parseMessage(message) {
     roleSource = html;
   }
   const role = cleanRoleTitle(rawRole);
-  if (/^student\b/i.test(role)) return null;
+  if (/^student\b/i.test(role)) return { ignored: 'student job' };
   const location = roleLocation(rawRole) || inferLocation(roleSource);
   const tab = chooseTab(role, rawRole + '\n' + subject + '\n' + String(roleSource || '').slice(0, 500));
   const season = tab === CONFIG.internshipsTab ? pickSeason(rawRole, subject, roleSource) : '';
@@ -484,6 +502,7 @@ function parseMessage(message) {
     season: season,
     threadId: threadId,
     applicationKey: applicationKey(company, role, season),
+    confidence: found.confidence,
   };
 }
 
@@ -603,21 +622,25 @@ const WEAK_COMPANY_PATTERNS = [
   ['body', /(?:^|\n)\s*([A-Z][\w&.' -]{1,40}?)\s+(?:talent acquisition|human resources|recruiting|recruitment|hiring)\b/],
 ];
 
+function companyResult(company, confidence) {
+  return { company: company || '', confidence: company ? confidence : 0 };
+}
+
 function inferCompany(fromHeader, subject, body, altBody) {
   // "Thank you for applying to Databricks" beats a Greenhouse or "Talent Team" sender.
   const explicit =
     companyFromPatterns(subject, body, EXPLICIT_COMPANY_PATTERNS) ||
     companyFromPatterns(subject, altBody || '', EXPLICIT_COMPANY_PATTERNS);
-  if (explicit) return explicit;
+  if (explicit) return companyResult(explicit, 0.95);
   const fromName = companyFromSender(fromHeader);
-  if (fromName) return fromName;
+  if (fromName) return companyResult(fromName, 0.82);
   const weak =
     companyFromPatterns(subject, body, WEAK_COMPANY_PATTERNS) ||
     companyFromPatterns(subject, altBody || '', WEAK_COMPANY_PATTERNS);
-  if (weak) return weak;
+  if (weak) return companyResult(weak, 0.55);
   const workday = String(fromHeader || '').match(/([a-z0-9]+)@myworkday\.com/i);
-  if (workday) return cleanCompany(workday[1]);
-  return companyFromDomain(fromHeader);
+  if (workday && cleanCompany(workday[1])) return companyResult(cleanCompany(workday[1]), 0.72);
+  return companyResult(companyFromDomain(fromHeader), 0.72);
 }
 
 const PLATFORM_DOMAINS = [
@@ -653,14 +676,15 @@ function companyFromSender(fromHeader) {
     const personal = [words.join('.'), words.join('_'), words.join('-'), words[0].charAt(0) + words[1]];
     if (personal.indexOf(local) >= 0) return '';
   }
-  return cleanCompany(display);
+  if (/\bworkday support\b/i.test(display)) return '';
+  return companyFromCandidate(display);
 }
 
 function companyFromCandidate(raw) {
   let text = cleanText(raw).split('\n')[0].replace(/\.(\s.*)?$/, '');
   // "the Platform Software Engineering Intern at Intuitive" names the company after "at".
   const around = text.split(/\s(?:at|with)\s/i);
-  if (around.length > 1 && (/^(?:the|our|an?)\s/i.test(text) || ROLE_WORDS.test(around[0]))) {
+  if (around.length > 1 && (/^(?:the|our|an?|join(?:ing)?)\s/i.test(text) || ROLE_WORDS.test(around[0]))) {
     text = around[around.length - 1];
   }
   text = text.split(/[|!?:;()\[\]]/)[0];
@@ -710,7 +734,8 @@ function cleanCompany(name) {
   const lower = text.toLowerCase();
   if (!text || text.length > 60 || text.split(/\s+/).length > 6 || text.indexOf('@') >= 0) return '';
   if (PLATFORM_COMPANIES[lower] || GENERIC_SENDER_NAMES[lower]) return '';
-  if (/^(?:the|our|a|an|one|this|joining|being|your|my|dear|hi|hello|candidate|campus)\b/i.test(text)) return '';
+  if (lower === 'us' || lower === 'our' || lower === 'team' || lower === 'human resources' || lower === 'talent acquisition' || lower === 'workday support') return '';
+  if (/^(?:the|our|a|an|one|this|joining|being|your|my|dear|hi|hello|candidate|campus|join)\b/i.test(text)) return '';
   if (ROLE_WORDS.test(text) || /thank|application|applying|campus/i.test(text)) return '';
   return text;
 }
@@ -865,10 +890,23 @@ function extractPleaseNote(body) {
     }
     const sentence = note.match(/^.*?[.!?](?=\s|$)/);
     if (sentence) note = sentence[0];
-    if (note) return note.slice(0, 300);
+    if (note) return clipText(note);
   }
   const official = text.match(/[^.]*official communication[^.]*\./i);
-  return official ? official[0].trim().slice(0, 500) : '';
+  return official ? clipText(official[0].trim()) : '';
+}
+
+function clipText(text, limit) {
+  const value = String(text || '').trim();
+  const max = limit || 5000;
+  if (value.length <= max) return value;
+  const window = value.slice(0, max);
+  const marks = ['. ', '! ', '? ', ' '];
+  for (let i = 0; i < marks.length; i += 1) {
+    const end = window.lastIndexOf(marks[i]);
+    if (end >= 40) return window.slice(0, marks[i] === ' ' ? end : end + 1).trim();
+  }
+  return window.trim();
 }
 
 function inferLocation(body) {
@@ -953,6 +991,7 @@ function otherTab(tab) {
 }
 
 function applyHint(hint) {
+  if (Number(hint.confidence || 1) < 0.7) return 'review';
   const intended = sheetForTab(hint.tab);
   if (!intended) return 'skipped';
   const match = findApplicationMatch(hint);
@@ -1176,7 +1215,12 @@ function mergeNotes(current, incoming) {
   let out = now;
   lines.forEach((line) => {
     const part = line.trim();
-    if (part && out.indexOf(part) === -1) out = (out + '\n' + part).trim();
+    if (!part || out.indexOf(part) !== -1) return;
+    if (/^source:/i.test(part)) {
+      const url = part.replace(/^source:\s*/i, '');
+      if (url && out.indexOf(url) !== -1) return;
+    }
+    out = (out + '\n' + part).trim();
   });
   return out;
 }
@@ -1338,6 +1382,11 @@ function finishToast(title, counts, extra) {
     ', review ' +
     (counts.review || 0);
   if (counts.failed) text += ', failed ' + counts.failed;
+  const reasons = counts.skippedReasons || {};
+  const reasonText = Object.keys(reasons)
+    .map((name) => reasons[name] + ' ' + name)
+    .join(', ');
+  if (reasonText) text += '. Skipped ' + reasonText;
   if (extra) text += extra;
   if (counts.missingLocations && counts.missingLocations.length) {
     const unique = counts.missingLocations.filter((name, index) => counts.missingLocations.indexOf(name) === index);

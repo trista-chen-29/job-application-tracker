@@ -200,9 +200,9 @@ def clean_company(name: str) -> str:
     lower = text.lower()
     if not text or len(text) > 60 or len(text.split()) > 6 or "@" in text:
         return ""
-    if lower in PLATFORM_COMPANIES or lower in GENERIC_SENDER_NAMES:
+    if lower in PLATFORM_COMPANIES or lower in GENERIC_SENDER_NAMES or lower in DEPARTMENT_NAMES:
         return ""
-    if re.match(r"(?:the|our|a|an|one|this|joining|being|your|my|dear|hi|hello|candidate|campus)\b", text, re.I):
+    if re.match(r"(?:the|our|a|an|one|this|joining|being|your|my|dear|hi|hello|candidate|campus|join)\b", text, re.I):
         return ""
     if ROLE_WORDS_RE.search(text) or re.search(r"thank|application|applying|campus", text, re.I):
         return ""
@@ -226,7 +226,10 @@ def company_from_sender(from_header: str) -> str:
         personal = {".".join(words), "_".join(words), "-".join(words), words[0][:1] + words[1]}
         if local in personal:
             return ""
-    return clean_company(display)
+    if re.search(r"\bworkday support\b", display, re.I):
+        return ""
+    # "Notion we appreciate your interest…" and "join the team at Quora" are not company names.
+    return company_from_candidate(display)
 
 
 def company_from_candidate(raw: str) -> str:
@@ -234,7 +237,9 @@ def company_from_candidate(raw: str) -> str:
     text = re.sub(r"\.(\s.*)?$", "", text, count=1)
     # "the Platform Software Engineering Intern at Intuitive" names the company after "at".
     around = re.split(r"\s(?:at|with)\s", text, flags=re.I)
-    if len(around) > 1 and (re.match(r"(?:the|our|an?)\s", text, re.I) or ROLE_WORDS_RE.search(around[0])):
+    if len(around) > 1 and (
+        re.match(r"(?:the|our|an?|join(?:ing)?)\s", text, re.I) or ROLE_WORDS_RE.search(around[0])
+    ):
         text = around[-1]
     text = re.split(r"[|!?:;()\[\]]", text)[0]
     text = re.split(
@@ -261,6 +266,16 @@ WEAK_COMPANY_PATTERNS = (
         re.compile(r"(?:^|\n)\s*([A-Z][\w&.' -]{1,40}?)\s+(?:talent acquisition|human resources|recruiting|recruitment|hiring)\b"),
     ),
 )
+DEPARTMENT_NAMES = {
+    "us",
+    "our",
+    "team",
+    "human resources",
+    "talent acquisition",
+    "workday support",
+    "university recruiting",
+}
+COMPANY_CONFIDENCE = {"explicit": 0.95, "sender": 0.82, "domain": 0.72, "weak": 0.55}
 GENERIC_SENDER_NAMES = {
     "talent",
     "recruiting",
@@ -298,25 +313,29 @@ def company_from_patterns(subject: str, body: str, patterns) -> str:
     return ""
 
 
-def infer_company(from_header: str, subject: str, body: str, alt_body: str = "") -> str:
+def infer_company(from_header: str, subject: str, body: str, alt_body: str = "") -> tuple[str, str]:
+    """Return (company, source). source is explicit, sender, weak, or domain."""
     # "Thank you for applying to Databricks" beats a Greenhouse or "Talent Team" sender.
     explicit = company_from_patterns(subject, body, EXPLICIT_COMPANY_PATTERNS) or company_from_patterns(
         subject, alt_body, EXPLICIT_COMPANY_PATTERNS
     )
     if explicit:
-        return explicit
+        return explicit, "explicit"
     from_name = company_from_sender(from_header)
     if from_name:
-        return from_name
+        return from_name, "sender"
     weak = company_from_patterns(subject, body, WEAK_COMPANY_PATTERNS) or company_from_patterns(
         subject, alt_body, WEAK_COMPANY_PATTERNS
     )
     if weak:
-        return weak
+        return weak, "weak"
     workday = re.search(r"([a-z0-9]+)@myworkday\.com", str(from_header or ""), re.I)
     if workday:
-        return clean_company(workday.group(1))
-    return company_from_domain(from_header)
+        tenant = clean_company(workday.group(1))
+        if tenant:
+            return tenant, "domain"
+    domain = company_from_domain(from_header)
+    return (domain, "domain") if domain else ("", "")
 
 
 PLATFORM_DOMAINS = {
@@ -486,9 +505,22 @@ def extract_please_note(body: str) -> str:
         if sentence:
             note = sentence.group(0)
         if note:
-            return note[:300]
+            return clip_text(note)
     official = re.search(r"[^.]*official communication[^.]*\.", text, re.I)
-    return official.group(0).strip()[:500] if official else ""
+    return clip_text(official.group(0).strip()) if official else ""
+
+
+def clip_text(text: str, limit: int = 5000) -> str:
+    """Keep stored notes intact. Only shorten past `limit`, and never in the middle of a word."""
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    window = value[:limit]
+    for mark in (". ", "! ", "? ", " "):
+        end = window.rfind(mark)
+        if end >= 40:
+            return window[: end if mark == " " else end + 1].strip()
+    return window.strip()
 
 
 def is_generic_role(role: str) -> bool:
@@ -557,7 +589,7 @@ def parse_mail(from_header: str, subject: str, body: str) -> dict | None:
     result = infer_result(subject, body)
     if not result:
         return None
-    company = infer_company(header, subject, body)
+    company, source = infer_company(header, subject, body)
     if not company or is_ignored_company(company):
         return None
     raw_role = infer_raw_role(subject, body)
@@ -575,4 +607,27 @@ def parse_mail(from_header: str, subject: str, body: str) -> dict | None:
         "season": pick_season(raw_role, subject, body) if tab == INTERNSHIPS_TAB else "",
         "useful_note": extract_please_note(body),
         "confirmation": is_confirmation(result, subject, body),
+        "confidence": COMPANY_CONFIDENCE.get(source, 0.5),
     }
+
+
+def skip_reason(from_header: str, subject: str, body: str) -> str:
+    """Why parse_mail returned nothing, for the sync report."""
+    header = str(from_header or "")
+    if PERSONAL_SENDER_RE.search(header):
+        return "personal sender"
+    subject = clean_text(subject)
+    if NOISE_SUBJECT_RE.search(subject):
+        return "not an application"
+    body = clean_text(body)
+    if not infer_result(subject, body):
+        return "no status"
+    company, _source = infer_company(header, subject, body)
+    if is_ignored_company(company):
+        return "ignored company"
+    if not company:
+        return "no company"
+    role = clean_role_title(infer_raw_role(subject, body))
+    if re.match(r"student\b", role, re.I):
+        return "student job"
+    return ""

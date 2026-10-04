@@ -1224,3 +1224,170 @@ class GoogleSheetFillTests(TestCase):
         self.assertEqual(merged[2], "Firmware Engineering Intern")
         self.assertEqual(merged[5], "Offer")
 
+
+class AuditFixTests(TestCase):
+    def test_push_hints_writes_a_batch_update(self):
+        from unittest.mock import patch
+
+        from tracker.services.gsheet import SheetHint, push_hints
+
+        class FakeRequest:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def execute(self):
+                return self.payload
+
+        class FakeValues:
+            def __init__(self):
+                self.updates = []
+
+            def get(self, **kwargs):
+                return FakeRequest(
+                    {"values": [["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"]]}
+                )
+
+            def batchUpdate(self, **kwargs):
+                self.updates.append(kwargs)
+                return FakeRequest({})
+
+        class FakeSpreadsheets:
+            def __init__(self):
+                self.values_api = FakeValues()
+
+            def values(self):
+                return self.values_api
+
+        class FakeService:
+            def spreadsheets(self):
+                return spreadsheets
+
+        spreadsheets = FakeSpreadsheets()
+        hint = SheetHint(
+            company="Stripe",
+            role="Software Engineer Intern",
+            location="",
+            tab="internships",
+            result="Applied",
+            notes="From email: thanks",
+            date_applied="09/24/2026",
+            season="Summer 2027",
+        )
+        with patch("googleapiclient.discovery.build", return_value=FakeService()):
+            result = push_hints(object(), "sheet-id", [hint])
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(len(spreadsheets.values_api.updates), 1)
+        ranges = spreadsheets.values_api.updates[0]["body"]["data"]
+        self.assertTrue(any(item["range"].startswith("'internships'!A1:") for item in ranges))
+
+    def test_interview_note_appears_on_the_detail_page(self):
+        from tracker.models import InterviewStage
+
+        user = User.objects.create_user("notes", "notes@example.com", "pass12345")
+        self.client.force_login(user)
+        opp = Opportunity.objects.create(user=user, company="Stripe", title="Software Engineer Intern")
+        stage = InterviewStage.objects.create(opportunity=opp, stage_name="Phone screen")
+        response = self.client.post(
+            reverse("interview_note", args=[opp.pk, stage.pk]),
+            {"note_type": "general", "content": "Ask about the on-call rotation"},
+        )
+        self.assertEqual(response.status_code, 302)
+        detail = self.client.get(reverse("opportunity_detail", args=[opp.pk]))
+        self.assertContains(detail, "Ask about the on-call rotation")
+
+    def test_mangled_sender_names_become_the_employer(self):
+        from tracker.services.extract import parse_mail
+
+        received = "Your application has been received."
+        cases = [
+            ("MIT SH Workday Support <noreply@magna.com>", "Magna"),
+            ("Human Resources <jobs@kenect.com>", "Kenect"),
+            ("the Platform Software Engineering Intern at Intuitive <jobs@intuitive.com>", "Intuitive"),
+            ("Notion we appreciate your interest in joining our team <jobs@notion.so>", "Notion"),
+            ("join the team at Quora <jobs@quora.com>", "Quora"),
+            ("the Associate Test Technician at Element Materials Technology <jobs@element.com>", "Element Materials Technology"),
+        ]
+        for sender, company in cases:
+            parsed = parse_mail(sender, "Thank you for applying", received)
+            self.assertIsNotNone(parsed, sender)
+            self.assertEqual(parsed["company"], company, sender)
+        us = parse_mail("Us <jobs@kenect.com>", "Thank you for applying", received)
+        self.assertNotEqual(us["company"], "Us")
+
+    def test_long_note_is_not_cut_mid_word(self):
+        from tracker.services.extract import clip_text
+
+        intact = "Sentence one. " * 200
+        self.assertLessEqual(len(intact), 5000)
+        self.assertEqual(clip_text(intact), intact.strip())
+        long = ("alpha " * 2000).strip()
+        clipped = clip_text(long, 80)
+        self.assertLessEqual(len(clipped), 80)
+        self.assertTrue(clipped.endswith("alpha"))
+
+    def test_low_confidence_parse_is_review_and_not_written(self):
+        from tracker.services.mailparse import apply_mail_hints, parse_message
+
+        user = User.objects.create_user("lowconf", "lowconf@example.com", "pass12345")
+        hint = parse_message(
+            "Pat Lee <pat.lee@acme.com>",
+            "Your application",
+            "Thank you for your interest in Acme Labs. We regret to inform you that you have not been selected.",
+        )
+        self.assertIsNotNone(hint)
+        self.assertLess(hint.confidence, 0.7)
+        result = apply_mail_hints(user, [hint])
+        self.assertEqual(result["review"], 1)
+        self.assertEqual(result["created"], 0)
+        self.assertFalse(Opportunity.objects.filter(user=user).exists())
+
+    def test_duplicate_source_link_is_not_appended_twice(self):
+        from tracker.services.gsheet import SheetHint, _merged_row
+        from tracker.services.mailparse import _merge_note_text
+
+        source = "Source: https://mail.google.com/mail/u/0/#all/abc"
+        self.assertEqual(_merge_note_text("hello\n" + source, source), "hello\n" + source)
+        headers = ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"]
+        existing = ["09/24/2026", "Kenect", "Intern", "", "", "Applied", "hello\n" + source]
+        hint = SheetHint(
+            company="Kenect",
+            role="Intern",
+            location="",
+            tab="internships",
+            result="Rejected",
+            notes=source,
+            date_applied="",
+        )
+        merged = _merged_row(headers, hint, existing, "internships")
+        self.assertEqual(merged[6].count(source), 1)
+
+    def test_gmail_sync_get_is_not_allowed(self):
+        user = User.objects.create_user("getsync", "getsync@example.com", "pass12345")
+        self.client.force_login(user)
+        response = self.client.get(reverse("gmail_sync"))
+        self.assertEqual(response.status_code, 405)
+
+    def test_review_mail_is_parked_after_three_attempts(self):
+        from tracker.models import GmailProcessedMessage
+        from tracker.services.mailparse import PARSER_VERSION
+        from tracker.views import _done_message_ids, _save_gmail_log, _stale_message_ids
+
+        user = User.objects.create_user("parked", "parked@example.com", "pass12345")
+        for _ in range(3):
+            _save_gmail_log(user, "review-mail", parse_status="review", parser_version=PARSER_VERSION)
+        record = GmailProcessedMessage.objects.get(user=user, message_id="review-mail")
+        self.assertEqual(record.parse_status, "parked")
+        self.assertEqual(record.fetch_attempts, 3)
+        self.assertNotIn("review-mail", _stale_message_ids(user))
+        self.assertIn("review-mail", _done_message_ids(user))
+
+    def test_opportunity_list_is_paged(self):
+        user = User.objects.create_user("pages", "pages@example.com", "pass12345")
+        self.client.force_login(user)
+        for index in range(51):
+            Opportunity.objects.create(user=user, company=f"Co{index:02d}", title="Intern")
+        response = self.client.get(reverse("opportunity_list") + "?page=2")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.context["opportunities"]), 1)
+        self.assertContains(response, "Page 2 of 2")
+

@@ -185,7 +185,40 @@ assert.strictEqual(invented.season, '');
 assert.strictEqual(invented.location, '');
 assert.strictEqual(invented.tab, 'newgrad');
 
-assert.ok(code.includes('parserVersion: 11'));
+assert.strictEqual(
+  ctx.inferCompany('MIT SH Workday Support <noreply@magna.com>', 'Thanks', 'Your application has been received.').company,
+  'Magna'
+);
+assert.strictEqual(ctx.inferCompany('Human Resources <jobs@kenect.com>', '', '').company, 'Kenect');
+assert.strictEqual(
+  ctx.inferCompany('the Platform Software Engineering Intern at Intuitive <jobs@intuitive.com>', '', '').company,
+  'Intuitive'
+);
+assert.strictEqual(
+  ctx.inferCompany('Notion we appreciate your interest in joining our team <jobs@notion.so>', '', '').company,
+  'Notion'
+);
+assert.notStrictEqual(ctx.inferCompany('Us <jobs@kenect.com>', '', '').company, 'Us');
+assert.strictEqual(ctx.inferCompany('join the team at Quora <jobs@quora.com>', '', '').company, 'Quora');
+assert.strictEqual(
+  ctx.inferCompany('the Associate Test Technician at Element Materials Technology <jobs@element.com>', '', '').company,
+  'Element Materials Technology'
+);
+const weak = ctx.inferCompany(
+  'Pat Lee <pat.lee@acme.com>',
+  'Update',
+  'Thank you for your interest in Acme Labs.'
+);
+assert.strictEqual(weak.company, 'Acme Labs');
+assert.ok(weak.confidence < 0.7);
+assert.strictEqual(ctx.applyHint({ confidence: 0.55, tab: 'internships' }), 'review');
+const source = 'Source: https://mail.google.com/mail/u/0/#all/abc';
+assert.strictEqual(ctx.mergeNotes('hello\n' + source, source), 'hello\n' + source);
+const clipped = ctx.clipText(('alpha ').repeat(1200), 80);
+assert.ok(clipped.length <= 80);
+assert.ok(clipped.endsWith('alpha'));
+
+assert.ok(code.includes('parserVersion: 12'));
 
 ctx.onOpen();
 assert.strictEqual(searches.length, 0, 'simple onOpen must not read Gmail');

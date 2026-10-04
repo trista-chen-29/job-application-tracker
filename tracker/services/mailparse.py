@@ -75,7 +75,7 @@ def parse_message(
         company=parsed["company"],
         title=parsed["role"],
         status=STATUS_FROM_RESULT[parsed["result"]],
-        confidence=0.9,
+        confidence=float(parsed.get("confidence") or 0.5),
         note=compose_notes(parsed["useful_note"], source_url),
         source_id=source_id,
         thread_id=thread_id,
@@ -117,7 +117,7 @@ def _norm_company(name: str) -> str:
     return text
 
 
-PARSER_VERSION = 11
+PARSER_VERSION = 12
 
 
 def to_sheet_hint(hint: MailHint):
@@ -127,7 +127,7 @@ def to_sheet_hint(hint: MailHint):
         company=hint.company,
         role=hint.title,
         location=hint.location,
-        tab=hint.tab or "newgrad",
+        tab=hint.tab or "internships",
         result=result_label(hint.status),
         notes=hint.note,
         date_applied=hint.date_applied,
@@ -147,11 +147,11 @@ def _match_opportunity(
 
     if len(_norm_company(company)) < 2:
         return None, "skipped"
-    matches = [
-        opp
-        for opp in Opportunity.objects.filter(user=user, is_archived=False)
-        if extract.companies_match(opp.company, company)
-    ]
+    queryset = Opportunity.objects.filter(user=user, is_archived=False)
+    token = _norm_company(company).split(" ")[0]
+    if len(token) >= 3:
+        queryset = queryset.filter(company__icontains=token)
+    matches = [opp for opp in queryset if extract.companies_match(opp.company, company)]
     if not matches:
         return None, "create"
     role_hits = [opp for opp in matches if normalize_company(opp.title) == normalize_company(title)]
@@ -198,12 +198,31 @@ def _applied_datetime(value: str):
         return None
 
 
+def _merge_note_text(current: str, incoming: str) -> str:
+    """Append new note lines, but never a second copy of the same Gmail thread link."""
+    out = (current or "").strip()
+    for part in str(incoming or "").split("\n"):
+        line = part.strip()
+        if not line or line in out:
+            continue
+        if line.lower().startswith("source:"):
+            url = line.split(":", 1)[1].strip()
+            if url and url in out:
+                continue
+        out = f"{out}\n{line}".strip() if out else line
+    return out
+
+
 def apply_mail_hints(user, hints: list[MailHint]) -> dict:
     created = 0
     updated = 0
     skipped = 0
     review = 0
     for hint in hints:
+        if hint.confidence < 0.7:
+            review += 1
+            hint.disposition = "review"
+            continue
         existing, action = _match_opportunity(user, hint.company, hint.title, hint.status)
         if action == "review":
             review += 1
@@ -218,8 +237,9 @@ def apply_mail_hints(user, hints: list[MailHint]) -> dict:
             if hint.location and not existing.location:
                 existing.location = hint.location
                 fields_changed = True
-            if hint.note and hint.note not in (existing.notes or ""):
-                existing.notes = f"{existing.notes}\n{hint.note}".strip() if existing.notes else hint.note
+            merged_notes = _merge_note_text(existing.notes or "", hint.note)
+            if merged_notes != (existing.notes or ""):
+                existing.notes = merged_notes
                 fields_changed = True
             if fields_changed:
                 existing.save()

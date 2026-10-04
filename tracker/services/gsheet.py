@@ -425,7 +425,16 @@ def apply_hint_grids(grids: dict[str, list[list[str]]], hint: SheetHint) -> dict
     if located and located["tab"] != tab:
         result["from_tab"] = located["tab"]
     return result
-    return chr(ord("A") + index)
+
+
+def _col_letter(index: int) -> str:
+    """0-based column index to a Sheets column letter: 0 → A, 25 → Z, 26 → AA."""
+    number = max(int(index), 0) + 1
+    letters = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
 
 
 def _realign_row(row: list[str], src_headers: list[str], dest_headers: list[str]) -> list[str]:
@@ -466,11 +475,9 @@ def _merged_row(headers: list[str], hint: SheetHint, existing: list[str] | None,
         value = mapping.get(key, "")
         current = str(row[index] or "")
         if key in {"notes", "note"} and value:
-            parts = [part.strip() for part in str(value).split("\n") if part.strip()]
-            for part in parts:
-                if part not in current:
-                    current = f"{current}\n{part}".strip() if current else part
-            row[index] = current
+            from tracker.services.mailparse import _merge_note_text
+
+            row[index] = _merge_note_text(current, str(value))
             continue
         if key in {"result", "status"}:
             if should_advance(current, str(value)) or not current:
