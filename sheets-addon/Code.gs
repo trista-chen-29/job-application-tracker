@@ -1494,15 +1494,25 @@ function upsertLog(log, fields) {
     if (name === 'synced_at') return new Date();
     return fields[name] || '';
   });
-  if (existing) {
-    sheet.getRange(existing.row, 1, 1, LOG_HEADERS.length).setValues([rowValues]);
-    log.byId[fields.message_id] = Object.assign({}, existing, fields, { row: existing.row });
-    return;
-  }
-  sheet.appendRow(rowValues);
-  const row = sheet.getLastRow();
-  log.byId[fields.message_id] = Object.assign({ row: row }, fields);
-  log.records.push(log.byId[fields.message_id]);
+  // Column F is parse_status (applied / review / ignored / failed). A copied tracker
+  // tab still has the Result dropdown there, and Sheets rejects anything else.
+  const row = existing ? existing.row : Math.max(sheet.getLastRow(), 1) + 1;
+  writeLogRow(sheet, row, rowValues);
+  log.byId[fields.message_id] = Object.assign({}, existing || {}, fields, { row: row });
+  if (!existing) log.records.push(log.byId[fields.message_id]);
+}
+
+function writeLogRow(sheet, row, rowValues) {
+  if (row > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), row - sheet.getMaxRows());
+  const range = sheet.getRange(row, 1, 1, rowValues.length);
+  range.clearDataValidations();
+  range.setValues([rowValues]);
+}
+
+function clearLogValidations(sheet) {
+  const rows = Math.max(sheet.getMaxRows(), 1);
+  const cols = Math.max(sheet.getMaxColumns(), LOG_HEADERS.length);
+  sheet.getRange(1, 1, rows, cols).clearDataValidations();
 }
 
 function ensureLogSheet() {
@@ -1510,10 +1520,12 @@ function ensureLogSheet() {
   let sheet = book.getSheetByName(CONFIG.logTab);
   if (!sheet) {
     sheet = book.insertSheet(CONFIG.logTab);
+    clearLogValidations(sheet);
     sheet.appendRow(LOG_HEADERS);
     sheet.hideSheet();
     return sheet;
   }
+  clearLogValidations(sheet);
   const lastCol = Math.max(sheet.getLastColumn(), 1);
   const current = sheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
   if (current.length < LOG_HEADERS.length || String(current[0] || '').toLowerCase() !== 'message_id') {

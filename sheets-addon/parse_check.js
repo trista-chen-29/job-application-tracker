@@ -18,6 +18,7 @@ function makeSheet(name) {
     getLastRow: () => data.length,
     getLastColumn: () => data[0].length,
     getMaxRows: () => Math.max(data.length, 20),
+    getMaxColumns: () => Math.max(data[0].length, 9),
     hideSheet() {},
     appendRow(values) {
       data.push(values.map(String));
@@ -31,6 +32,7 @@ function makeSheet(name) {
       setValue() {},
       setValues() {},
       setBackground() {},
+      clearDataValidations() {},
     }),
   };
 }
@@ -219,6 +221,44 @@ assert.ok(clipped.length <= 80);
 assert.ok(clipped.endsWith('alpha'));
 
 assert.ok(code.includes('parserVersion: 12'));
+
+let logBlocked = true;
+const loggedRows = [];
+ctx.upsertLog(
+  {
+    sheet: {
+      getLastRow: () => 21,
+      getMaxRows: () => 100,
+      getRange: () => ({
+        clearDataValidations() {
+          logBlocked = false;
+        },
+        setValues(values) {
+          if (logBlocked) {
+            throw new Error(
+              'The data you entered in cell F22 violates the data validation rules set on this cell. Please enter one of the following values: Applied, Rejected, OA, Interview, Offer.'
+            );
+          }
+          loggedRows.push(values[0]);
+        },
+      }),
+    },
+    byId: {},
+    records: [],
+  },
+  {
+    message_id: 'm1',
+    thread_id: 't1',
+    subject: 'Thank you for applying',
+    parser_version: 12,
+    parse_status: 'applied',
+    application_key: 'acme|intern|',
+    tab: 'internships',
+    last_error: '',
+  }
+);
+assert.strictEqual(loggedRows.length, 1);
+assert.strictEqual(loggedRows[0][5], 'applied');
 
 ctx.onOpen();
 assert.strictEqual(searches.length, 0, 'simple onOpen must not read Gmail');
