@@ -1229,9 +1229,24 @@ function clearTrackerRow(sheet, row, cols) {
   ['date', 'company', 'role', 'location', 'season', 'result', 'notes', 'source'].forEach((key) => {
     if (cols[key] < 0) return;
     const cell = sheet.getRange(row, cols[key] + 1);
-    cell.setValue('');
+    // Result and Season dropdowns reject a blank, which aborts the whole sync.
+    clearCellKeepingValidation(cell);
     if (key === 'location' || key === 'role') cell.setBackground(null);
   });
+}
+
+function clearCellKeepingValidation(cell) {
+  const rule = typeof cell.getDataValidation === 'function' ? cell.getDataValidation() : null;
+  if (rule && typeof cell.setDataValidation === 'function') cell.setDataValidation(null);
+  try {
+    cell.setValue('');
+  } catch (err) {
+    if (!/data validation/i.test(String(err))) throw err;
+    if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
+    if (typeof cell.setDataValidation === 'function') cell.setDataValidation(null);
+    cell.setValue('');
+  }
+  if (rule && typeof cell.setDataValidation === 'function') cell.setDataValidation(rule);
 }
 
 function headerMap(sheet) {
@@ -1505,14 +1520,28 @@ function upsertLog(log, fields) {
 function writeLogRow(sheet, row, rowValues) {
   if (row > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), row - sheet.getMaxRows());
   const range = sheet.getRange(row, 1, 1, rowValues.length);
-  range.clearDataValidations();
-  range.setValues([rowValues]);
+  dropValidation(range);
+  try {
+    range.setValues([rowValues]);
+  } catch (err) {
+    // Sheets still enforces the old dropdown until the cleared rule is flushed.
+    if (!/data validation/i.test(String(err))) throw err;
+    if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
+    dropValidation(range);
+    range.setValues([rowValues]);
+  }
+}
+
+function dropValidation(range) {
+  if (typeof range.clearDataValidations === 'function') range.clearDataValidations();
+  if (typeof range.setDataValidation === 'function') range.setDataValidation(null);
 }
 
 function clearLogValidations(sheet) {
   const rows = Math.max(sheet.getMaxRows(), 1);
   const cols = Math.max(sheet.getMaxColumns(), LOG_HEADERS.length);
-  sheet.getRange(1, 1, rows, cols).clearDataValidations();
+  dropValidation(sheet.getRange(1, 1, rows, cols));
+  if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
 }
 
 function ensureLogSheet() {

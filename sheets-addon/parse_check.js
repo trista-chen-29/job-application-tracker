@@ -32,6 +32,10 @@ function makeSheet(name) {
       setValue() {},
       setValues() {},
       setBackground() {},
+      getDataValidation() {
+        return null;
+      },
+      setDataValidation() {},
       clearDataValidations() {},
     }),
   };
@@ -79,7 +83,7 @@ function triggerBuilder(handler) {
 
 const ctx = {
   console,
-  SpreadsheetApp: { getActive: () => book, getUi: book.getUi, CopyPasteType: {} },
+  SpreadsheetApp: { getActive: () => book, getUi: book.getUi, CopyPasteType: {}, flush() {} },
   PropertiesService: {
     getDocumentProperties: () => ({
       getProperty: (key) => (key in props ? props[key] : null),
@@ -222,19 +226,22 @@ assert.ok(clipped.endsWith('alpha'));
 
 assert.ok(code.includes('parserVersion: 12'));
 
-let logBlocked = true;
+let logReady = false;
 const loggedRows = [];
+const previousFlush = ctx.SpreadsheetApp.flush;
+ctx.SpreadsheetApp.flush = () => {
+  logReady = true;
+};
 ctx.upsertLog(
   {
     sheet: {
       getLastRow: () => 21,
       getMaxRows: () => 100,
       getRange: () => ({
-        clearDataValidations() {
-          logBlocked = false;
-        },
+        clearDataValidations() {},
+        setDataValidation() {},
         setValues(values) {
-          if (logBlocked) {
+          if (!logReady) {
             throw new Error(
               'The data you entered in cell F22 violates the data validation rules set on this cell. Please enter one of the following values: Applied, Rejected, OA, Interview, Offer.'
             );
@@ -259,6 +266,42 @@ ctx.upsertLog(
 );
 assert.strictEqual(loggedRows.length, 1);
 assert.strictEqual(loggedRows[0][5], 'applied');
+
+let resultOpen = true;
+let resultBlanked = false;
+let resultRestored = null;
+const resultRule = { id: 'result-dropdown' };
+ctx.SpreadsheetApp.flush = () => {
+  resultOpen = false;
+};
+const resultCell = {
+  getDataValidation: () => resultRule,
+  setDataValidation(next) {
+    if (next === resultRule) resultRestored = next;
+  },
+  setValue(value) {
+    if (resultOpen) {
+      throw new Error(
+        'The data you entered in cell F22 violates the data validation rules set on this cell. Please enter one of the following values: Applied, Rejected, OA, Interview, Offer.'
+      );
+    }
+    resultBlanked = value === '';
+  },
+  setBackground() {},
+};
+ctx.clearTrackerRow({ getRange: () => resultCell }, 22, {
+  date: 0,
+  company: 1,
+  role: 2,
+  location: 3,
+  season: 4,
+  result: 5,
+  notes: 6,
+  source: -1,
+});
+assert.strictEqual(resultBlanked, true);
+assert.strictEqual(resultRestored, resultRule);
+ctx.SpreadsheetApp.flush = previousFlush;
 
 ctx.onOpen();
 assert.strictEqual(searches.length, 0, 'simple onOpen must not read Gmail');
