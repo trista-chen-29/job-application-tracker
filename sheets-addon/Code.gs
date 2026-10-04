@@ -1238,14 +1238,9 @@ function clearTrackerRow(sheet, row, cols) {
 function clearCellKeepingValidation(cell) {
   const rule = typeof cell.getDataValidation === 'function' ? cell.getDataValidation() : null;
   if (rule && typeof cell.setDataValidation === 'function') cell.setDataValidation(null);
-  try {
-    cell.setValue('');
-  } catch (err) {
-    if (!/data validation/i.test(String(err))) throw err;
-    if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
-    if (typeof cell.setDataValidation === 'function') cell.setDataValidation(null);
-    cell.setValue('');
-  }
+  // The dropdown is still enforced until this flush. Writing first makes Sheets reject the blank.
+  if (rule && typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
+  cell.setValue('');
   if (rule && typeof cell.setDataValidation === 'function') cell.setDataValidation(rule);
 }
 
@@ -1324,13 +1319,24 @@ function sortSheetByDate(sheet) {
     rank[item.i] = [pos];
   });
   // Range.sort moves each row's highlights and dropdowns with it; a temporary key column controls the order.
+  // A Result value Sheets does not like (a blank, or a status outside the dropdown) aborts the sort at that cell.
+  const body = sheet.getRange(2, 1, last - 1, width);
+  const rules = typeof body.getDataValidations === 'function' ? body.getDataValidations() : null;
+  if (rules) {
+    body.setDataValidation(null);
+    if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
+  }
   const keyCol = width + 1;
   sheet.insertColumnAfter(width);
   try {
     sheet.getRange(2, keyCol, rank.length, 1).setValues(rank);
     sheet.getRange(2, 1, rank.length, keyCol).sort({ column: keyCol, ascending: true });
   } finally {
-    sheet.deleteColumn(keyCol);
+    try {
+      sheet.deleteColumn(keyCol);
+    } finally {
+      if (rules && typeof body.setDataValidations === 'function') body.setDataValidations(rules);
+    }
   }
   return true;
 }
@@ -1371,7 +1377,17 @@ function roleShouldReplace(current, next) {
 
 function writeCell(sheet, row, colIndex, value) {
   if (colIndex < 0 || value === '' || value === null || typeof value === 'undefined') return;
-  sheet.getRange(row, colIndex + 1).setValue(value);
+  const cell = sheet.getRange(row, colIndex + 1);
+  try {
+    cell.setValue(value);
+  } catch (err) {
+    if (!/data validation/i.test(String(err))) throw err;
+    const rule = typeof cell.getDataValidation === 'function' ? cell.getDataValidation() : null;
+    if (typeof cell.setDataValidation === 'function') cell.setDataValidation(null);
+    if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
+    cell.setValue(value);
+    if (rule && typeof cell.setDataValidation === 'function') cell.setDataValidation(rule);
+  }
 }
 
 // Writes the value and clears the highlight, or highlights the cell when the value is missing.
@@ -1521,15 +1537,9 @@ function writeLogRow(sheet, row, rowValues) {
   if (row > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), row - sheet.getMaxRows());
   const range = sheet.getRange(row, 1, 1, rowValues.length);
   dropValidation(range);
-  try {
-    range.setValues([rowValues]);
-  } catch (err) {
-    // Sheets still enforces the old dropdown until the cleared rule is flushed.
-    if (!/data validation/i.test(String(err))) throw err;
-    if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
-    dropValidation(range);
-    range.setValues([rowValues]);
-  }
+  // Flush before the write. Sheets otherwise checks the Result dropdown that is still on column F.
+  if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
+  range.setValues([rowValues]);
 }
 
 function dropValidation(range) {
@@ -1544,6 +1554,29 @@ function clearLogValidations(sheet) {
   if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
 }
 
+function columnHasValidation(sheet, col) {
+  const rows = Math.min(Math.max(sheet.getMaxRows(), 1), 5);
+  const range = sheet.getRange(1, col, rows, 1);
+  if (typeof range.getDataValidations !== 'function') return false;
+  const rules = range.getDataValidations();
+  for (let i = 0; i < rules.length; i += 1) {
+    if (rules[i][0]) return true;
+  }
+  return false;
+}
+
+function replaceSheetWithoutValidation(book, sheet) {
+  const values = sheet.getDataRange().getValues();
+  const name = sheet.getName();
+  book.deleteSheet(sheet);
+  const fresh = book.insertSheet(name);
+  if (values.length && values[0].length) {
+    fresh.getRange(1, 1, values.length, values[0].length).setValues(values);
+  }
+  fresh.hideSheet();
+  return fresh;
+}
+
 function ensureLogSheet() {
   const book = SpreadsheetApp.getActive();
   let sheet = book.getSheetByName(CONFIG.logTab);
@@ -1554,6 +1587,8 @@ function ensureLogSheet() {
     sheet.hideSheet();
     return sheet;
   }
+  // A log copied from the tracker keeps the Result dropdown on column F, which rejects applied/review.
+  if (columnHasValidation(sheet, 6)) sheet = replaceSheetWithoutValidation(book, sheet);
   clearLogValidations(sheet);
   const lastCol = Math.max(sheet.getLastColumn(), 1);
   const current = sheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
