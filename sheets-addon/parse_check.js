@@ -226,6 +226,61 @@ assert.ok(clipped.endsWith('alpha'));
 
 assert.ok(code.includes('parserVersion: 12'));
 
+const recentOrder = ctx.orderRecentFirst([
+  { message_id: 'old', thread_id: 't1', _time: 1 },
+  { message_id: 'new-other', thread_id: 't2', _time: 5 },
+  { message_id: 'mid', thread_id: 't1', _time: 3 },
+]);
+const recentIds = [];
+for (let i = 0; i < recentOrder.length; i += 1) recentIds.push(String(recentOrder[i].message_id));
+assert.strictEqual(recentIds.join(','), 'new-other,old,mid');
+assert.strictEqual(ctx.shouldReprocess({ parse_status: 'review', fetch_attempts: 0, parser_version: 12 }), true);
+assert.strictEqual(ctx.shouldReprocess({ parse_status: 'review', fetch_attempts: 3, parser_version: 12 }), false);
+assert.strictEqual(ctx.shouldReprocess({ parse_status: 'parked', fetch_attempts: 3, parser_version: 1 }), false);
+
+const fullSource = 'Source: https://mail.google.com/mail/u/0/#all/19c74817aff44fb3';
+const shortSource = 'Source: https://mail.google.com/mail/';
+assert.strictEqual(ctx.mergeNotes(fullSource, shortSource), fullSource);
+assert.strictEqual(ctx.mergeNotes(shortSource, fullSource), fullSource);
+
+function junkStaysOut(from, subject, body) {
+  const hint = ctx.parseMessage(message(from, subject, body, ''));
+  if (!hint || hint.ignored) return;
+  assert.ok(Number(hint.confidence) < 0.9, from + ' ' + hint.company + ' ' + hint.confidence);
+  assert.ok(!/logging into|any time by logging|any point by logging/i.test(hint.company || ''), hint.company);
+  assert.strictEqual(ctx.applyHint(hint), 'review', from + ' ' + hint.company);
+}
+const received = 'Your application has been received.';
+junkStaysOut('Tim Farrell <recruiting@visa.com>', 'Update', 'Unfortunately we are not moving forward.');
+junkStaysOut('Avav <notes@avav.io>', 'Application received', received);
+junkStaysOut('noreply@tranetechnologies.com', 'Thank you for applying', received);
+junkStaysOut('Visa People <people@visa.com>', 'Application received', received);
+junkStaysOut('Team Kenect <hello@kenect.com>', 'Application received', received);
+junkStaysOut('Snowflake Hiring Team <jobs@snowflake.com>', 'Application received', received);
+junkStaysOut('Legal <legal@acme.com>', 'Application received', received);
+junkStaysOut('HR <hr@acme.com>', 'Application received', received);
+junkStaysOut(
+  'Workday <notifications@myworkday.com>',
+  'Update',
+  'You can view your application at any time by logging into the portal. We regret to inform you.'
+);
+junkStaysOut(
+  'Workday <notifications@myworkday.com>',
+  'Update',
+  'You can check status at any point by logging into the portal. We regret to inform you.'
+);
+assert.strictEqual(ctx.inferLocation('Location: 18855 Adams Court'), '');
+const tracked = ctx.parseMessage(
+  message(
+    'Acme <jobs@acme.com>',
+    'Thank you for applying to Acme',
+    'Your application for the Software Engineer https://awstrack.me/L0/abc role has been received.',
+    ''
+  )
+);
+assert.ok(!String(tracked.role || '').includes('awstrack'));
+assert.ok(tracked.confidence >= 0.9);
+
 let logReady = false;
 const loggedRows = [];
 const previousFlush = ctx.SpreadsheetApp.flush;

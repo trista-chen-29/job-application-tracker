@@ -19,8 +19,10 @@ const CONFIG = {
   runBudgetMs: 270000,
   // Time triggers only accept 1, 5, 10, 15, or 30 minutes.
   syncEveryMinutes: 10,
-  // Once the first full pass is done, automatic runs only look this far back.
-  recentDays: 7,
+  // Each run reads this window before the older backlog. After a full pass, runs stay inside this window.
+  priorityDays: 14,
+  // review/failed mail is parked after this many tries so it stops consuming the run.
+  parkAfter: 3,
   // Must match the Season dropdown on the internships tab.
   seasonOptions: ['Winter 2027', 'Spring 2027', 'Summer 2027'],
   // Mail from these senders is never added (for example on-campus student jobs).
@@ -39,6 +41,7 @@ const LOG_HEADERS = [
   'application_key',
   'tab',
   'last_error',
+  'fetch_attempts',
 ];
 
 const RESULT_RANK = {
@@ -244,12 +247,51 @@ function syncGmail() {
 
 function runGmailSync() {
   const started = Date.now();
+  const deadline = started + CONFIG.runBudgetMs;
   const props = PropertiesService.getDocumentProperties();
+  props.deleteProperty('logRebuiltThisRun');
   // A new parser version needs one full pass over old mail before timed runs go back to recent mail only.
   const caughtUp = props.getProperty('syncCaughtUp') === String(CONFIG.parserVersion);
-  const query = 'newer_than:' + (caughtUp ? CONFIG.recentDays : CONFIG.lookbackDays) + 'd ' + GMAIL_QUERY_TERMS;
-  const threads = searchThreads(query, caughtUp ? 100 : CONFIG.maxThreads);
+  quarantineBlankCompanies();
   const log = loadLogRows();
+  // This week's mail first. Inside one thread the older message still runs first, so the confirmation exists before the rejection.
+  const recent = orderRecentFirst(
+    collectMessages('newer_than:' + CONFIG.priorityDays + 'd ' + GMAIL_QUERY_TERMS, 200, log)
+  );
+  const counts = processMessageRecords(recent, log, deadline);
+  if (!caughtUp && Date.now() < deadline) {
+    const seen = {};
+    recent.forEach((record) => {
+      seen[record.message_id] = true;
+    });
+    const backlog = collectMessages('newer_than:' + CONFIG.lookbackDays + 'd ' + GMAIL_QUERY_TERMS, CONFIG.maxThreads, log)
+      .filter((record) => !seen[record.message_id]);
+    backlog.sort((a, b) => a._time - b._time);
+    addCounts(counts, processMessageRecords(backlog, log, deadline));
+  }
+  sortTrackerTabs();
+  let extra = '';
+  if (counts.remaining) {
+    props.deleteProperty('syncCaughtUp');
+    extra = '. ' + counts.remaining + ' emails left; auto-sync continues in ' + CONFIG.syncEveryMinutes + ' minutes';
+  } else if (!caughtUp) {
+    props.setProperty('syncCaughtUp', String(CONFIG.parserVersion));
+    extra = '. All matching mail is processed';
+  } else {
+    extra = '. Recent mail is processed';
+  }
+  if (props.getProperty('logRebuiltThisRun') === '1') {
+    extra += '. Rebuilt the Gmail log (' + (props.getProperty('logRebuilds') || '1') + ').';
+  }
+  if (!counts.created && !counts.updated && !counts.review && !counts.failed && !counts.remaining) {
+    notify('Up to date. Nothing new in Gmail.', 'Gmail sync');
+    return;
+  }
+  finishToast('Gmail sync', counts, extra);
+}
+
+function collectMessages(query, maxThreads, log) {
+  const threads = searchThreads(query, maxThreads);
   const records = [];
   for (let i = 0; i < threads.length; i += 100) {
     const chunk = threads.slice(i, i + 100);
@@ -264,29 +306,81 @@ function runGmailSync() {
           parser_version: existing ? Number(existing.parser_version || 0) : 0,
           parse_status: existing ? existing.parse_status : '',
           application_key: existing ? existing.application_key || '' : '',
+          fetch_attempts: existing ? Number(existing.fetch_attempts || 0) : 0,
           _message: message,
           _time: message.getDate().getTime(),
         });
       });
     });
   }
-  // Oldest first, so the confirmation creates the row before later OA / rejection mail updates it.
-  records.sort((a, b) => a._time - b._time);
-  const counts = processMessageRecords(records, log, started + CONFIG.runBudgetMs);
-  sortTrackerTabs();
-  let extra = '';
-  if (counts.remaining) {
-    props.deleteProperty('syncCaughtUp');
-    extra = '. ' + counts.remaining + ' emails left; auto-sync continues in ' + CONFIG.syncEveryMinutes + ' minutes';
-  } else {
-    props.setProperty('syncCaughtUp', String(CONFIG.parserVersion));
-    extra = '. All matching mail is processed';
+  return records;
+}
+
+function orderRecentFirst(records) {
+  const groups = {};
+  records.forEach((record) => {
+    const key = record.thread_id || record.message_id;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(record);
+  });
+  return Object.keys(groups)
+    .map((key) => {
+      const messages = groups[key].sort((a, b) => a._time - b._time);
+      return { newest: messages[messages.length - 1]._time, messages: messages };
+    })
+    .sort((a, b) => b.newest - a.newest)
+    .reduce((all, group) => all.concat(group.messages), []);
+}
+
+function addCounts(total, extra) {
+  ['created', 'updated', 'skipped', 'review', 'failed', 'remaining'].forEach((key) => {
+    total[key] = (total[key] || 0) + (extra[key] || 0);
+  });
+  const reasons = extra.skippedReasons || {};
+  Object.keys(reasons).forEach((name) => {
+    total.skippedReasons[name] = (total.skippedReasons[name] || 0) + reasons[name];
+  });
+  if (extra.missingLocations && extra.missingLocations.length) {
+    total.missingLocations = (total.missingLocations || []).concat(extra.missingLocations);
   }
-  if (!counts.created && !counts.updated && !counts.review && !counts.failed && !counts.remaining) {
-    notify('Up to date. Nothing new in Gmail.', 'Gmail sync');
-    return;
+}
+
+function quarantineBlankCompanies() {
+  const book = SpreadsheetApp.getActive();
+  if (!book) return;
+  [findNamedSheet(CONFIG.internshipsAliases), findNamedSheet(CONFIG.newgradAliases)].forEach((sheet) => {
+    if (!sheet) return;
+    const cols = headerMap(sheet);
+    if (cols.company < 0) return;
+    const last = sheet.getLastRow();
+    if (last < 2) return;
+    const width = Math.max(sheet.getLastColumn(), 1);
+    const values = sheet.getRange(2, 1, last - 1, width).getValues();
+    const moving = [];
+    for (let i = values.length - 1; i >= 0; i -= 1) {
+      if (String(values[i][cols.company] || '').trim()) continue;
+      const filled = values[i].some((cell, index) => index !== cols.company && String(cell || '').trim());
+      if (!filled) continue;
+      moving.push(values[i]);
+      sheet.deleteRow(i + 2);
+    }
+    if (!moving.length) return;
+    const quarantine = ensureQuarantineSheet(book);
+    moving.reverse().forEach((row) => quarantine.appendRow(row));
+  });
+}
+
+function ensureQuarantineSheet(book) {
+  let sheet = book.getSheetByName('_quarantine');
+  if (!sheet) {
+    sheet = book.insertSheet('_quarantine');
+    const intern = findNamedSheet(CONFIG.internshipsAliases);
+    const headers = intern
+      ? intern.getRange(1, 1, 1, Math.max(intern.getLastColumn(), 1)).getDisplayValues()[0]
+      : ['Date Applied', 'Company', 'Role', 'Location', 'Season', 'Result', 'Notes'];
+    sheet.appendRow(headers);
   }
-  finishToast('Gmail sync', counts, extra);
+  return sheet;
 }
 
 function searchThreads(query, max) {
@@ -302,11 +396,24 @@ function searchThreads(query, max) {
 
 function shouldReprocess(record) {
   if (!record) return true;
-  const version = Number(record.parser_version || 0);
   const status = String(record.parse_status || '');
+  if (status === 'parked') return false;
+  if ((status === 'failed' || status === 'review') && Number(record.fetch_attempts || 0) >= CONFIG.parkAfter) return false;
   if (status === 'failed' || status === 'review') return true;
-  if (version < CONFIG.parserVersion) return true;
+  if (Number(record.parser_version || 0) < CONFIG.parserVersion) return true;
   return false;
+}
+
+function withAttempts(record, status) {
+  let attempts = Number(record && record.fetch_attempts || 0);
+  let parseStatus = status;
+  if (status === 'review' || status === 'failed') {
+    attempts += 1;
+    if (attempts >= CONFIG.parkAfter) parseStatus = 'parked';
+  } else {
+    attempts = 0;
+  }
+  return { parse_status: parseStatus, fetch_attempts: attempts };
 }
 
 function processMessageRecords(records, log, deadline) {
@@ -323,14 +430,8 @@ function processMessageRecords(records, log, deadline) {
       if (!message) message = GmailApp.getMessageById(record.message_id);
     } catch (err) {
       counts.failed += 1;
-      upsertLog(log, {
-        message_id: record.message_id,
+      rememberLog(log, { getId: () => record.message_id, getSubject: () => record.subject || '' }, record, 'failed', {
         thread_id: record.thread_id || '',
-        subject: record.subject || '',
-        parser_version: CONFIG.parserVersion,
-        parse_status: 'failed',
-        application_key: '',
-        tab: '',
         last_error: String(err),
       });
       continue;
@@ -339,16 +440,7 @@ function processMessageRecords(records, log, deadline) {
     if (hint && hint.ignored) {
       counts.skipped += 1;
       counts.skippedReasons[hint.ignored] = (counts.skippedReasons[hint.ignored] || 0) + 1;
-      upsertLog(log, {
-        message_id: message.getId(),
-        thread_id: safeThreadId(message),
-        subject: message.getSubject() || '',
-        parser_version: CONFIG.parserVersion,
-        parse_status: 'ignored',
-        application_key: '',
-        tab: '',
-        last_error: hint.ignored,
-      });
+      rememberLog(log, message, record, 'ignored', { last_error: hint.ignored });
       continue;
     }
     if (hint && record.application_key && record.application_key !== hint.applicationKey) {
@@ -358,16 +450,7 @@ function processMessageRecords(records, log, deadline) {
     if (!hint) {
       counts.skipped += 1;
       counts.skippedReasons['no company'] = (counts.skippedReasons['no company'] || 0) + 1;
-      upsertLog(log, {
-        message_id: message.getId(),
-        thread_id: safeThreadId(message),
-        subject: message.getSubject() || '',
-        parser_version: CONFIG.parserVersion,
-        parse_status: 'ignored',
-        application_key: '',
-        tab: '',
-        last_error: 'no company',
-      });
+      rememberLog(log, message, record, 'ignored', { last_error: 'no company' });
       continue;
     }
     let action = 'failed';
@@ -375,12 +458,8 @@ function processMessageRecords(records, log, deadline) {
       action = applyHint(hint);
     } catch (err) {
       counts.failed += 1;
-      upsertLog(log, {
-        message_id: message.getId(),
+      rememberLog(log, message, record, 'failed', {
         thread_id: hint.threadId || safeThreadId(message),
-        subject: message.getSubject() || '',
-        parser_version: CONFIG.parserVersion,
-        parse_status: 'failed',
         application_key: hint.applicationKey || '',
         tab: hint.tab || '',
         last_error: String(err),
@@ -394,19 +473,34 @@ function processMessageRecords(records, log, deadline) {
     else if (action === 'updated') counts.updated += 1;
     else if (action === 'review') counts.review += 1;
     else counts.skipped += 1;
-    upsertLog(log, {
-      message_id: message.getId(),
+    rememberLog(log, message, record, action === 'review' ? 'review' : 'applied', {
       thread_id: hint.threadId || safeThreadId(message),
-      subject: message.getSubject() || '',
-      parser_version: CONFIG.parserVersion,
-      parse_status: action === 'review' ? 'review' : 'applied',
       application_key: hint.applicationKey || '',
       tab: hint.tab || '',
-      last_error: '',
     });
   }
   counts.missingLocations = missingLocations;
   return counts;
+}
+
+function rememberLog(log, message, record, status, fields) {
+  const attempt = withAttempts(record, status);
+  upsertLog(
+    log,
+    Object.assign(
+      {
+        message_id: message.getId(),
+        thread_id: safeThreadId(message),
+        subject: message.getSubject() || '',
+        parser_version: CONFIG.parserVersion,
+        application_key: '',
+        tab: '',
+        last_error: '',
+      },
+      fields || {},
+      attempt
+    )
+  );
 }
 
 function safeThreadId(message) {
@@ -633,14 +727,14 @@ function inferCompany(fromHeader, subject, body, altBody) {
     companyFromPatterns(subject, altBody || '', EXPLICIT_COMPANY_PATTERNS);
   if (explicit) return companyResult(explicit, 0.95);
   const fromName = companyFromSender(fromHeader);
-  if (fromName) return companyResult(fromName, 0.82);
+  if (fromName) return companyResult(fromName, 0.6);
   const weak =
     companyFromPatterns(subject, body, WEAK_COMPANY_PATTERNS) ||
     companyFromPatterns(subject, altBody || '', WEAK_COMPANY_PATTERNS);
   if (weak) return companyResult(weak, 0.55);
   const workday = String(fromHeader || '').match(/([a-z0-9]+)@myworkday\.com/i);
-  if (workday && cleanCompany(workday[1])) return companyResult(cleanCompany(workday[1]), 0.72);
-  return companyResult(companyFromDomain(fromHeader), 0.72);
+  if (workday && cleanCompany(workday[1])) return companyResult(cleanCompany(workday[1]), 0.6);
+  return companyResult(companyFromDomain(fromHeader), 0.6);
 }
 
 const PLATFORM_DOMAINS = [
@@ -734,8 +828,9 @@ function cleanCompany(name) {
   const lower = text.toLowerCase();
   if (!text || text.length > 60 || text.split(/\s+/).length > 6 || text.indexOf('@') >= 0) return '';
   if (PLATFORM_COMPANIES[lower] || GENERIC_SENDER_NAMES[lower]) return '';
-  if (lower === 'us' || lower === 'our' || lower === 'team' || lower === 'human resources' || lower === 'talent acquisition' || lower === 'workday support') return '';
-  if (/^(?:the|our|a|an|one|this|joining|being|your|my|dear|hi|hello|candidate|campus|join)\b/i.test(text)) return '';
+  if (lower === 'us' || lower === 'our' || lower === 'team' || lower === 'human resources' || lower === 'talent acquisition' || lower === 'workday support' || lower === 'legal') return '';
+  if (/^(?:the|our|a|an|one|this|joining|being|your|my|dear|hi|hello|candidate|campus|join|any|team)\b/i.test(text)) return '';
+  if (/\blogging\b/i.test(text)) return '';
   if (ROLE_WORDS.test(text) || /thank|application|applying|campus/i.test(text)) return '';
   return text;
 }
@@ -801,6 +896,7 @@ function isValidRole(raw) {
   if (!ROLE_WORDS.test(role)) return false;
   // "Role" or "Internship" is not the job title. Keep looking.
   if (isGenericRole(role)) return false;
+  if (/https?:|awstrack\.me|@/i.test(role)) return false;
   return !/\b(?:thank|application|applying|your|we|you)\b/i.test(role);
 }
 
@@ -821,6 +917,7 @@ function cleanRoleTitle(title) {
   text = text.replace(/\s*[-–]\s*20\d{2}\b(?=\s*(?:\(|$))/, '');
   text = text.replace(/\s+20\d{2}$/, '');
   text = text.replace(/\s+,/g, ',');
+  text = text.replace(/https?:\S+/gi, '').replace(/\bawstrack\.me\S*/gi, '');
   text = text.replace(/\s+(?:role|position|opening|opportunity|job)$/i, '');
   text = text.replace(/\s+has been received.*$/i, '');
   return text.replace(/\s+/g, ' ').replace(/^[-–—,: ]+|[-–—,: ]+$/g, '').slice(0, 150);
@@ -912,9 +1009,15 @@ function clipText(text, limit) {
 function inferLocation(body) {
   const text = String(body || '');
   const labeled = text.match(/\blocation\s*:\s*([A-Z][A-Za-z .]+,\s*[A-Z]{2}\b|remote|hybrid)/i);
-  if (labeled) return labeled[1].trim();
+  if (labeled) return cleanLocation(labeled[1]);
   const placed = text.match(/\b(?:based in|located in|office in)\s+([A-Z][A-Za-z .]+,\s*[A-Z]{2})\b/);
-  return placed ? placed[1].trim() : '';
+  return placed ? cleanLocation(placed[1]) : '';
+}
+
+function cleanLocation(value) {
+  const text = String(value || '').trim();
+  if (/^\d+\s/.test(text) || /\b(?:court|street|avenue|road|drive|lane|blvd|boulevard)\b/i.test(text)) return '';
+  return text;
 }
 
 function chooseTab(title, body) {
@@ -991,7 +1094,8 @@ function otherTab(tab) {
 }
 
 function applyHint(hint) {
-  if (Number(hint.confidence || 1) < 0.7) return 'review';
+  // Missing confidence is not a pass. Only an explicit "applying to X" parse is trusted enough to write a row.
+  if (!(Number(hint.confidence) >= 0.9)) return 'review';
   const intended = sheetForTab(hint.tab);
   if (!intended) return 'skipped';
   const match = findApplicationMatch(hint);
@@ -1206,23 +1310,52 @@ function pickResult(current, incoming) {
   return current || incoming;
 }
 
+function sourceThreadId(line) {
+  const url = String(line || '').replace(/^source:\s*/i, '').trim();
+  const match = url.match(/([0-9a-f]{10,})/i);
+  return match ? match[1].toLowerCase() : '';
+}
+
 function mergeNotes(current, incoming) {
-  const now = String(current || '').trim();
-  const nxt = String(incoming || '').trim();
-  if (!nxt) return now;
-  if (!now) return nxt;
-  const lines = nxt.split(/\n+/);
-  let out = now;
+  const lines = (String(current || '') + '\n' + String(incoming || '')).split(/\n+/);
+  const out = [];
+  const sourceAt = {};
   lines.forEach((line) => {
     const part = line.trim();
-    if (!part || out.indexOf(part) !== -1) return;
+    if (!part) return;
     if (/^source:/i.test(part)) {
-      const url = part.replace(/^source:\s*/i, '');
-      if (url && out.indexOf(url) !== -1) return;
+      const id = sourceThreadId(part);
+      const key = id || part.toLowerCase();
+      const previous = sourceAt[key];
+      if (previous === undefined) {
+        // A short "https://mail.google.com/mail/" is the same link as the full thread URL already stored.
+        const richer = id ? out.findIndex((item) => sourceThreadId(item) === id) : -1;
+        if (richer >= 0) {
+          if (part.length > out[richer].length) out[richer] = part;
+          sourceAt[key] = richer;
+          return;
+        }
+        const prefix = out.findIndex((item) => {
+          if (!/^source:/i.test(item)) return false;
+          const left = item.replace(/^source:\s*/i, '').trim();
+          const right = part.replace(/^source:\s*/i, '').trim();
+          return left.indexOf(right) === 0 || right.indexOf(left) === 0;
+        });
+        if (prefix >= 0) {
+          if (part.length > out[prefix].length) out[prefix] = part;
+          sourceAt[key] = prefix;
+          return;
+        }
+        sourceAt[key] = out.length;
+        out.push(part);
+      } else if (part.length > out[previous].length) {
+        out[previous] = part;
+      }
+      return;
     }
-    out = (out + '\n' + part).trim();
+    if (out.indexOf(part) === -1) out.push(part);
   });
-  return out;
+  return out.join('\n');
 }
 
 function clearTrackerRow(sheet, row, cols) {
@@ -1511,6 +1644,7 @@ function loadLogRows() {
       application_key: idx.application_key >= 0 ? String(values[i][idx.application_key] || '') : '',
       tab: idx.tab >= 0 ? String(values[i][idx.tab] || '') : '',
       last_error: idx.last_error >= 0 ? String(values[i][idx.last_error] || '') : '',
+      fetch_attempts: idx.fetch_attempts >= 0 ? Number(values[i][idx.fetch_attempts] || 0) : 0,
     };
     records.push(record);
     byId[messageId] = record;
@@ -1523,6 +1657,7 @@ function upsertLog(log, fields) {
   const existing = log.byId[fields.message_id];
   const rowValues = LOG_HEADERS.map((name) => {
     if (name === 'synced_at') return new Date();
+    if (name === 'fetch_attempts') return Number(fields.fetch_attempts || 0);
     return fields[name] || '';
   });
   // Column F is parse_status (applied / review / ignored / failed). A copied tracker
@@ -1588,7 +1723,13 @@ function ensureLogSheet() {
     return sheet;
   }
   // A log copied from the tracker keeps the Result dropdown on column F, which rejects applied/review.
-  if (columnHasValidation(sheet, 6)) sheet = replaceSheetWithoutValidation(book, sheet);
+  if (columnHasValidation(sheet, 6)) {
+    sheet = replaceSheetWithoutValidation(book, sheet);
+    const props = PropertiesService.getDocumentProperties();
+    const count = Number(props.getProperty('logRebuilds') || '0') + 1;
+    props.setProperty('logRebuilds', String(count));
+    props.setProperty('logRebuiltThisRun', '1');
+  }
   clearLogValidations(sheet);
   const lastCol = Math.max(sheet.getLastColumn(), 1);
   const current = sheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];

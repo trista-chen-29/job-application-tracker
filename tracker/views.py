@@ -1063,7 +1063,7 @@ def _process_gmail_items(user, creds, items, sheet_id: str) -> dict:
         sheet_hints = [
             to_sheet_hint(hint)
             for hint in hints
-            if hint.confidence >= 0.7 and getattr(hint, "disposition", "") != "review"
+            if hint.confidence >= 0.9 and getattr(hint, "disposition", "") != "review"
         ]
         try:
             sheet_result = push_hints(creds, sheet_id, sheet_hints)

@@ -1,6 +1,6 @@
 # Job application tracker
 
-Gmail fills your existing Google Sheet. Application confirmation emails become new rows; later recruiter mail updates **Result** (OA, Interview, Offer, Rejected).
+Gmail fills your existing Google Sheet when a company sends mail about an application. A form that never emails you (some Ashby and Workday submissions) does not show up here. Add those by hand: company and role, then Add, on the Applications page. The sheet is not a complete list of everything you submitted.
 
 The live tracker is the spreadsheet, not the Django site. Tabs:
 
@@ -22,7 +22,7 @@ The live tracker is the spreadsheet plugin.
 - **Tracker → Recheck scraped mail** walks stale `_gmail_log` rows in batches of 30. **Reprocess all stale mail** restarts that walk.
 - A message ID in the log is not a permanent skip. Failed writes stay `failed` and are retried. Ignored mail (no company/status) is stored separately from failures.
 - Paste the latest [`sheets-addon/Code.gs`](sheets-addon/Code.gs) after pulling parser changes. The current parser version is **12**.
-- **Sync Gmail now** walks every matching thread (not just the newest 50), oldest first, and stops before the 6-minute Apps Script limit. Auto-sync (every 10 minutes) picks up anything left, then only scans the last 7 days.
+- **Sync Gmail now** reads the last 14 days first, then older mail if time is left. It stops before the 6-minute Apps Script limit. Auto-sync (every 10 minutes) picks up anything left. After a full pass, runs stay inside those 14 days. Mail that stays `review` or `failed` for 3 tries is parked and is not retried forever.
 - Rows are kept in **Date Applied** order, earliest first, after every sync. Rows without a date go after dated rows. **Tracker → Sort by Date Applied** re-sorts on demand.
 - Date Applied comes only from the confirmation email. Follow-up mail without a role (OA, rejection) updates the row in whatever tab it is already in.
 - Blank Role cells are highlighted light blue and blank Location cells yellow. Your own replies, job alerts, and anything in `CONFIG.ignoreCompanies` are skipped.

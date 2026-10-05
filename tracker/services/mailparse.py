@@ -198,19 +198,47 @@ def _applied_datetime(value: str):
         return None
 
 
+def _source_thread_id(line: str) -> str:
+    url = re.sub(r"(?i)^source:\s*", "", str(line or "")).strip()
+    match = re.search(r"([0-9a-f]{10,})", url, re.I)
+    return match.group(1).lower() if match else ""
+
+
 def _merge_note_text(current: str, incoming: str) -> str:
-    """Append new note lines, but never a second copy of the same Gmail thread link."""
-    out = (current or "").strip()
-    for part in str(incoming or "").split("\n"):
-        line = part.strip()
-        if not line or line in out:
+    """Keep one Source line per Gmail thread, preferring the longer URL."""
+    out: list[str] = []
+    source_at: dict[str, int] = {}
+    for raw in f"{current or ''}\n{incoming or ''}".split("\n"):
+        part = raw.strip()
+        if not part:
             continue
-        if line.lower().startswith("source:"):
-            url = line.split(":", 1)[1].strip()
-            if url and url in out:
+        if part.lower().startswith("source:"):
+            thread_id = _source_thread_id(part)
+            key = thread_id or part.lower()
+            if key in source_at:
+                if len(part) > len(out[source_at[key]]):
+                    out[source_at[key]] = part
                 continue
-        out = f"{out}\n{line}".strip() if out else line
-    return out
+            url = re.sub(r"(?i)^source:\s*", "", part).strip()
+            replaced = False
+            for index, existing in enumerate(out):
+                if not existing.lower().startswith("source:"):
+                    continue
+                other = re.sub(r"(?i)^source:\s*", "", existing).strip()
+                if other.startswith(url) or url.startswith(other):
+                    if len(part) > len(existing):
+                        out[index] = part
+                    source_at[key] = index
+                    replaced = True
+                    break
+            if replaced:
+                continue
+            source_at[key] = len(out)
+            out.append(part)
+            continue
+        if part not in out:
+            out.append(part)
+    return "\n".join(out)
 
 
 def apply_mail_hints(user, hints: list[MailHint]) -> dict:
@@ -219,7 +247,7 @@ def apply_mail_hints(user, hints: list[MailHint]) -> dict:
     skipped = 0
     review = 0
     for hint in hints:
-        if hint.confidence < 0.7:
+        if not (hint.confidence >= 0.9):
             review += 1
             hint.disposition = "review"
             continue

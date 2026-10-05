@@ -304,7 +304,7 @@ class MailParseTests(TestCase):
         hint = parse_message(
             "Northwind University <campus@northwind.com>",
             "Online assessment invitation",
-            "Please complete the HackerRank online assessment this week.",
+            "Please complete the HackerRank online assessment for your application at Northwind.",
         )
         self.assertIsNotNone(hint)
         result = apply_mail_hints(user, [hint])
@@ -332,7 +332,7 @@ class MailParseTests(TestCase):
         hint = parse_message(
             "no-reply@graphcore.ai",
             "Graphcore online assessment",
-            "Please complete the HackerRank online assessment for Firmware Engineering Intern.",
+            "Please complete the HackerRank online assessment for your application at Graphcore for the Firmware Engineering Intern role.",
         )
         self.assertEqual(hint.status, OpportunityStatus.ONLINE_ASSESSMENT)
         result = apply_mail_hints(user, [hint])
@@ -378,7 +378,7 @@ class MailParseTests(TestCase):
         hint = parse_message(
             "Harbor Recruiting <jobs@harbor.com>",
             "Update",
-            "Unfortunately we are not moving forward.",
+            "Unfortunately we are not moving forward with your application at Harbor.",
         )
         result = apply_mail_hints(user, [hint])
         self.assertEqual(result["skipped"], 1)
@@ -392,7 +392,7 @@ class MailParseTests(TestCase):
         hint = parse_message(
             "Harbor Recruiting <jobs@harbor.com>",
             "Offer of employment",
-            "We are pleased to offer you an intern role.",
+            "We are pleased to offer you an intern role at Harbor.",
         )
         result = apply_mail_hints(user, [hint])
         self.assertEqual(result["updated"], 1)
@@ -1345,8 +1345,9 @@ class AuditFixTests(TestCase):
         from tracker.services.gsheet import SheetHint, _merged_row
         from tracker.services.mailparse import _merge_note_text
 
-        source = "Source: https://mail.google.com/mail/u/0/#all/abc"
+        source = "Source: https://mail.google.com/mail/u/0/#all/19c74817aff44fb3"
         self.assertEqual(_merge_note_text("hello\n" + source, source), "hello\n" + source)
+        self.assertEqual(_merge_note_text(source, "Source: https://mail.google.com/mail/"), source)
         headers = ["Date Applied", "Company", "Role", "Location", "Season", "Result", "Notes"]
         existing = ["09/24/2026", "Kenect", "Intern", "", "", "Applied", "hello\n" + source]
         hint = SheetHint(

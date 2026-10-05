@@ -200,9 +200,11 @@ def clean_company(name: str) -> str:
     lower = text.lower()
     if not text or len(text) > 60 or len(text.split()) > 6 or "@" in text:
         return ""
-    if lower in PLATFORM_COMPANIES or lower in GENERIC_SENDER_NAMES or lower in DEPARTMENT_NAMES:
+    if lower in PLATFORM_COMPANIES or lower in GENERIC_SENDER_NAMES or lower in DEPARTMENT_NAMES or lower == "legal":
         return ""
-    if re.match(r"(?:the|our|a|an|one|this|joining|being|your|my|dear|hi|hello|candidate|campus|join)\b", text, re.I):
+    if re.match(r"(?:the|our|a|an|one|this|joining|being|your|my|dear|hi|hello|candidate|campus|join|any|team)\b", text, re.I):
+        return ""
+    if re.search(r"\blogging\b", text, re.I):
         return ""
     if ROLE_WORDS_RE.search(text) or re.search(r"thank|application|applying|campus", text, re.I):
         return ""
@@ -275,7 +277,7 @@ DEPARTMENT_NAMES = {
     "workday support",
     "university recruiting",
 }
-COMPANY_CONFIDENCE = {"explicit": 0.95, "sender": 0.82, "domain": 0.72, "weak": 0.55}
+COMPANY_CONFIDENCE = {"explicit": 0.95, "sender": 0.6, "domain": 0.6, "weak": 0.55}
 GENERIC_SENDER_NAMES = {
     "talent",
     "recruiting",
@@ -415,6 +417,8 @@ def is_valid_role(raw: str) -> bool:
     # "Role" or "Internship" is not the job title. Keep looking.
     if is_generic_role(role):
         return False
+    if re.search(r"https?:|awstrack\.me|@", role, re.I):
+        return False
     return not re.search(r"\b(?:thank|application|applying|your|we|you)\b", role, re.I)
 
 
@@ -436,6 +440,8 @@ def clean_role_title(title: str) -> str:
     text = re.sub(r"\s*[-–]\s*20\d{2}\b(?=\s*(?:\(|$))", "", text, count=1)
     text = re.sub(r"\s+20\d{2}$", "", text, count=1)
     text = re.sub(r"\s+,", ",", text)
+    text = re.sub(r"https?:\S+", "", text, flags=re.I)
+    text = re.sub(r"\bawstrack\.me\S*", "", text, flags=re.I)
     text = re.sub(r"\s+(?:role|position|opening|opportunity|job)$", "", text, count=1, flags=re.I)
     text = re.sub(r"\s+has been received.*$", "", text, count=1, flags=re.I)
     return re.sub(r"\s+", " ", text).strip("-–—,: ")[:150]
@@ -480,13 +486,20 @@ def infer_season(text: str, default: str = "") -> str:
     return found if found in SEASON_OPTIONS else default
 
 
+def clean_location(value: str) -> str:
+    text = str(value or "").strip()
+    if re.match(r"^\d+\s", text) or re.search(r"\b(?:court|street|avenue|road|drive|lane|blvd|boulevard)\b", text, re.I):
+        return ""
+    return text
+
+
 def infer_location(body: str) -> str:
     text = str(body or "")
     labeled = re.search(r"\blocation\s*:\s*([A-Z][A-Za-z .]+,\s*[A-Z]{2}\b|remote|hybrid)", text, re.I)
     if labeled:
-        return labeled.group(1).strip()
+        return clean_location(labeled.group(1).strip())
     placed = re.search(r"\b(?:based in|located in|office in)\s+([A-Z][A-Za-z .]+,\s*[A-Z]{2})\b", text)
-    return placed.group(1).strip() if placed else ""
+    return clean_location(placed.group(1).strip()) if placed else ""
 
 
 def extract_please_note(body: str) -> str:
