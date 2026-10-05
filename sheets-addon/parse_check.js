@@ -377,6 +377,58 @@ assert.strictEqual(triggers.filter((trigger) => trigger.getHandlerFunction() ===
 assert.strictEqual(triggers.filter((trigger) => trigger.getHandlerFunction() === 'syncOnOpen').length, 0);
 assert.strictEqual(props.autoSyncOff, '1');
 const before = searches.length;
+const colorRows = [
+  ['Date Applied', 'Company', 'Role', 'Location', 'Season', 'Result', 'Notes'],
+  ['02/18/2026', 'Verkada', 'Backend', '', '', 'Rejected', 'note'],
+  ['04/08/2025', 'Element', 'Tech', 'Austin, TX', '', 'Offer', 'keep'],
+];
+const colorFills = colorRows.map((row) => row.map(() => '#ffffff'));
+colorFills[1][3] = '#ffd000';
+colorFills[2][0] = '#d9ead3';
+let insertedColumn = 0;
+const colorSheet = {
+  getLastRow: () => colorRows.length,
+  getLastColumn: () => colorRows[0].length,
+  insertColumnAfter() {
+    insertedColumn += 1;
+  },
+  deleteColumn() {
+    insertedColumn += 1;
+  },
+  getRange(r, c, nr, nc) {
+    const slice = (grid) => grid.slice(r - 1, r - 1 + nr).map((row) => row.slice(c - 1, c - 1 + nc));
+    return {
+      getValues: () => slice(colorRows),
+      getDisplayValues: () => slice(colorRows),
+      getBackgrounds: () => slice(colorFills),
+      getDataValidations: () => slice(colorRows).map((row) => row.map(() => null)),
+      setDataValidation() {},
+      setDataValidations() {},
+      setValues(grid) {
+        for (let i = 0; i < grid.length; i += 1) {
+          for (let j = 0; j < grid[i].length; j += 1) colorRows[r - 1 + i][c - 1 + j] = grid[i][j];
+        }
+      },
+      setBackgrounds(grid) {
+        for (let i = 0; i < grid.length; i += 1) {
+          for (let j = 0; j < grid[i].length; j += 1) colorFills[r - 1 + i][c - 1 + j] = grid[i][j];
+        }
+      },
+    };
+  },
+};
+assert.strictEqual(ctx.sortSheetByDate(colorSheet), true);
+assert.strictEqual(insertedColumn, 0, 'sorting must not insert a column');
+assert.strictEqual(colorRows[1][1], 'Element');
+assert.strictEqual(colorRows[2][1], 'Verkada');
+assert.strictEqual(colorFills[1][0], '#d9ead3');
+assert.strictEqual(colorFills[2][3], '#ffd000');
+colorRows[2][2] = '';
+ctx.paintMissingFields(colorSheet);
+assert.strictEqual(colorFills[1][0], '#d9ead3');
+assert.strictEqual(colorFills[2][2], '#9fc5e8');
+assert.strictEqual(colorFills[2][3], '#ffd000');
+
 ctx.syncGmail();
 assert.ok(searches.length > before, 'Sync Gmail now still runs after auto-sync is off');
 assert.strictEqual(triggers.filter((trigger) => trigger.getHandlerFunction() === 'syncGmail').length, 0);

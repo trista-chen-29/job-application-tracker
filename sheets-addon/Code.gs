@@ -1425,6 +1425,7 @@ function sortTrackerTabs() {
     if (!sheet) return;
     try {
       if (sortSheetByDate(sheet)) moved = true;
+      paintMissingFields(sheet);
     } catch (err) {
       notify('Could not sort ' + sheet.getName() + ': ' + err, 'Tracker');
     }
@@ -1432,13 +1433,28 @@ function sortTrackerTabs() {
   return moved;
 }
 
+function reorderRows(grid, order) {
+  return order.map((item) => grid[item.i]);
+}
+
+function sameColor(a, b) {
+  const norm = (color) => String(color || '').replace(/#/g, '').toLowerCase();
+  return norm(a) !== '' && norm(a) === norm(b);
+}
+
+function isTrackerHighlight(color) {
+  return sameColor(color, CONFIG.roleMissingColor) || sameColor(color, CONFIG.locationMissingColor);
+}
+
 // Earliest Date Applied first; rows without a date follow in their current order; blank rows stay at the bottom.
+// Rows are rewritten in place. A temporary column plus Range.sort was clearing fills and link colors.
 function sortSheetByDate(sheet) {
   const cols = headerMap(sheet);
   const last = sheet.getLastRow();
   if (cols.company < 0 || cols.date < 0 || last < 3) return false;
   const width = sheet.getLastColumn();
-  const values = sheet.getRange(2, 1, last - 1, width).getValues();
+  const body = sheet.getRange(2, 1, last - 1, width);
+  const values = body.getValues();
   const order = values
     .map((row, i) => {
       const filled = String(row[cols.company] || '').trim() !== '';
@@ -1447,31 +1463,50 @@ function sortSheetByDate(sheet) {
     })
     .sort((a, b) => a.tier - b.tier || a.time - b.time || a.i - b.i);
   if (order.every((item, pos) => item.i === pos)) return false;
-  const rank = [];
-  order.forEach((item, pos) => {
-    rank[item.i] = [pos];
-  });
-  // Range.sort moves each row's highlights and dropdowns with it; a temporary key column controls the order.
-  // A Result value Sheets does not like (a blank, or a status outside the dropdown) aborts the sort at that cell.
-  const body = sheet.getRange(2, 1, last - 1, width);
   const rules = typeof body.getDataValidations === 'function' ? body.getDataValidations() : null;
+  const backgrounds = typeof body.getBackgrounds === 'function' ? body.getBackgrounds() : null;
+  const rich = typeof body.getRichTextValues === 'function' ? body.getRichTextValues() : null;
+  const fontColors = !rich && typeof body.getFontColors === 'function' ? body.getFontColors() : null;
+  // A Result value Sheets does not like (a blank, or a status outside the dropdown) aborts the write.
   if (rules) {
     body.setDataValidation(null);
     if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
   }
-  const keyCol = width + 1;
-  sheet.insertColumnAfter(width);
-  try {
-    sheet.getRange(2, keyCol, rank.length, 1).setValues(rank);
-    sheet.getRange(2, 1, rank.length, keyCol).sort({ column: keyCol, ascending: true });
-  } finally {
-    try {
-      sheet.deleteColumn(keyCol);
-    } finally {
-      if (rules && typeof body.setDataValidations === 'function') body.setDataValidations(rules);
+  body.setValues(reorderRows(values, order));
+  if (rich && typeof body.setRichTextValues === 'function') body.setRichTextValues(reorderRows(rich, order));
+  if (fontColors && typeof body.setFontColors === 'function') body.setFontColors(reorderRows(fontColors, order));
+  if (backgrounds && typeof body.setBackgrounds === 'function') body.setBackgrounds(reorderRows(backgrounds, order));
+  if (rules && typeof body.setDataValidations === 'function') body.setDataValidations(reorderRows(rules, order));
+  return true;
+}
+
+// Blank Role and Location get their highlight back. Filled cells keep whatever color they already have.
+function paintMissingFields(sheet) {
+  const cols = headerMap(sheet);
+  const last = sheet.getLastRow();
+  if (!sheet || cols.company < 0 || last < 2) return;
+  const width = Math.max(sheet.getLastColumn(), 1);
+  const range = sheet.getRange(2, 1, last - 1, width);
+  if (typeof range.getBackgrounds !== 'function' || typeof range.setBackgrounds !== 'function') return;
+  const values = range.getValues();
+  const backgrounds = range.getBackgrounds();
+  let changed = false;
+  for (let i = 0; i < values.length; i += 1) {
+    if (!String(values[i][cols.company] || '').trim()) continue;
+    if (cols.role >= 0 && !String(values[i][cols.role] || '').trim() && !sameColor(backgrounds[i][cols.role], CONFIG.roleMissingColor)) {
+      backgrounds[i][cols.role] = CONFIG.roleMissingColor;
+      changed = true;
+    }
+    if (
+      cols.location >= 0 &&
+      !String(values[i][cols.location] || '').trim() &&
+      !sameColor(backgrounds[i][cols.location], CONFIG.locationMissingColor)
+    ) {
+      backgrounds[i][cols.location] = CONFIG.locationMissingColor;
+      changed = true;
     }
   }
-  return true;
+  if (changed) range.setBackgrounds(backgrounds);
 }
 
 function dateSortValue(value) {
@@ -1523,13 +1558,13 @@ function writeCell(sheet, row, colIndex, value) {
   }
 }
 
-// Writes the value and clears the highlight, or highlights the cell when the value is missing.
+// Writes the value and clears our highlight, or highlights the cell when the value is missing.
 function writeFlagged(sheet, row, colIndex, value, missingColor) {
   if (colIndex < 0) return;
   const cell = sheet.getRange(row, colIndex + 1);
   if (value) {
     cell.setValue(value);
-    cell.setBackground(null);
+    if (typeof cell.getBackground === 'function' && isTrackerHighlight(cell.getBackground())) cell.setBackground(null);
     return;
   }
   cell.setBackground(missingColor);
