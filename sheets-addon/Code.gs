@@ -15,6 +15,9 @@ const CONFIG = {
   parserVersion: 12,
   recheckBatch: 30,
   maxThreads: 2000,
+  // Each automatic run only opens this many threads. A full mailbox scan every 10 minutes uses up Gmail's daily limit.
+  recentThreads: 40,
+  backlogThreads: 40,
   // Apps Script stops a run at 6 minutes; leave time to write the log and toast.
   runBudgetMs: 270000,
   // Time triggers only accept 1, 5, 10, 15, or 30 minutes.
@@ -42,6 +45,7 @@ const LOG_HEADERS = [
   'tab',
   'last_error',
   'fetch_attempts',
+  'message_ms',
 ];
 
 const RESULT_RANK = {
@@ -186,6 +190,9 @@ function recheckScraped() {
   }
   try {
     runRecheck();
+  } catch (err) {
+    if (noteGmailQuota(err)) return;
+    throw err;
   } finally {
     lock.releaseLock();
   }
@@ -240,23 +247,50 @@ function syncGmail() {
   try {
     ensureAutoSync();
     runGmailSync();
+  } catch (err) {
+    if (noteGmailQuota(err)) return;
+    throw err;
   } finally {
     lock.releaseLock();
   }
+}
+
+function isGmailQuotaError(err) {
+  const text = String(err || '');
+  return /too many times for one day/i.test(text) && /gmail/i.test(text);
+}
+
+function pacificDay() {
+  return Utilities.formatDate(new Date(), 'America/Los_Angeles', 'yyyy-MM-dd');
+}
+
+function gmailQuotaBlocked(props) {
+  return props.getProperty('gmailQuotaDay') === pacificDay();
+}
+
+function noteGmailQuota(err) {
+  if (!isGmailQuotaError(err)) return false;
+  PropertiesService.getDocumentProperties().setProperty('gmailQuotaDay', pacificDay());
+  notify("Gmail's daily read limit is used up. It resets at midnight Pacific. Sync will try again then.", 'Gmail sync');
+  return true;
 }
 
 function runGmailSync() {
   const started = Date.now();
   const deadline = started + CONFIG.runBudgetMs;
   const props = PropertiesService.getDocumentProperties();
+  if (gmailQuotaBlocked(props)) {
+    notify("Gmail's daily read limit is used up. It resets at midnight Pacific. Sync will try again then.", 'Gmail sync');
+    return;
+  }
   props.deleteProperty('logRebuiltThisRun');
   // A new parser version needs one full pass over old mail before timed runs go back to recent mail only.
   const caughtUp = props.getProperty('syncCaughtUp') === String(CONFIG.parserVersion);
   quarantineBlankCompanies();
   const log = loadLogRows();
-  // This week's mail first. Inside one thread the older message still runs first, so the confirmation exists before the rejection.
+  // Newest mail first, and only threads that are not already logged. Inside one thread the older message still runs first.
   const recent = orderRecentFirst(
-    collectMessages('newer_than:' + CONFIG.priorityDays + 'd ' + GMAIL_QUERY_TERMS, 200, log)
+    collectMessages('newer_than:' + CONFIG.priorityDays + 'd ' + GMAIL_QUERY_TERMS, CONFIG.recentThreads, log, 0)
   );
   const counts = processMessageRecords(recent, log, deadline);
   if (!caughtUp && Date.now() < deadline) {
@@ -264,19 +298,30 @@ function runGmailSync() {
     recent.forEach((record) => {
       seen[record.message_id] = true;
     });
-    const backlog = collectMessages('newer_than:' + CONFIG.lookbackDays + 'd ' + GMAIL_QUERY_TERMS, CONFIG.maxThreads, log)
-      .filter((record) => !seen[record.message_id]);
-    backlog.sort((a, b) => a._time - b._time);
+    const offset = Number(props.getProperty('backlogOffset') || 0);
+    const page = searchThreads('newer_than:' + CONFIG.lookbackDays + 'd ' + GMAIL_QUERY_TERMS, CONFIG.backlogThreads, offset);
+    const backlog = collectThreads(
+      page.filter((thread) => threadNeedsFetch(thread, log)),
+      log
+    )
+      .filter((record) => !seen[record.message_id])
+      .sort((a, b) => a._time - b._time);
     addCounts(counts, processMessageRecords(backlog, log, deadline));
+    if (page.length < CONFIG.backlogThreads) {
+      props.setProperty('syncCaughtUp', String(CONFIG.parserVersion));
+      props.deleteProperty('backlogOffset');
+    } else {
+      props.setProperty('backlogOffset', String(offset + page.length));
+    }
   }
   sortTrackerTabs();
   let extra = '';
   if (counts.remaining) {
-    props.deleteProperty('syncCaughtUp');
     extra = '. ' + counts.remaining + ' emails left; auto-sync continues in ' + CONFIG.syncEveryMinutes + ' minutes';
-  } else if (!caughtUp) {
-    props.setProperty('syncCaughtUp', String(CONFIG.parserVersion));
+  } else if (!caughtUp && !props.getProperty('backlogOffset')) {
     extra = '. All matching mail is processed';
+  } else if (!caughtUp) {
+    extra = '. Older mail continues in ' + CONFIG.syncEveryMinutes + ' minutes';
   } else {
     extra = '. Recent mail is processed';
   }
@@ -290,8 +335,12 @@ function runGmailSync() {
   finishToast('Gmail sync', counts, extra);
 }
 
-function collectMessages(query, maxThreads, log) {
-  const threads = searchThreads(query, maxThreads);
+function collectMessages(query, maxThreads, log, start) {
+  const threads = searchThreads(query, maxThreads, start).filter((thread) => threadNeedsFetch(thread, log));
+  return collectThreads(threads, log);
+}
+
+function collectThreads(threads, log) {
   const records = [];
   for (let i = 0; i < threads.length; i += 100) {
     const chunk = threads.slice(i, i + 100);
@@ -299,6 +348,7 @@ function collectMessages(query, maxThreads, log) {
       messages.forEach((message) => {
         const existing = log.byId[message.getId()];
         if (existing && !shouldReprocess(existing)) return;
+        const when = message.getDate().getTime();
         records.push({
           message_id: message.getId(),
           thread_id: chunk[j].getId(),
@@ -307,13 +357,28 @@ function collectMessages(query, maxThreads, log) {
           parse_status: existing ? existing.parse_status : '',
           application_key: existing ? existing.application_key || '' : '',
           fetch_attempts: existing ? Number(existing.fetch_attempts || 0) : 0,
+          message_ms: when,
           _message: message,
-          _time: message.getDate().getTime(),
+          _time: when,
         });
       });
     });
   }
   return records;
+}
+
+// Skip a thread whose messages are already logged and whose newest mail is not newer than what we stored.
+function threadNeedsFetch(thread, log) {
+  const rows = (log.byThread && log.byThread[thread.getId()]) || [];
+  if (!rows.length) return true;
+  if (rows.some(shouldReprocess)) return true;
+  let known = 0;
+  rows.forEach((row) => {
+    known = Math.max(known, Number(row.message_ms || 0));
+  });
+  if (!known) return true;
+  const last = thread.getLastMessageDate().getTime();
+  return last > known;
 }
 
 function orderRecentFirst(records) {
@@ -383,11 +448,12 @@ function ensureQuarantineSheet(book) {
   return sheet;
 }
 
-function searchThreads(query, max) {
+function searchThreads(query, max, start) {
   const threads = [];
+  const offset = start || 0;
   while (threads.length < max) {
     const size = Math.min(100, max - threads.length);
-    const page = GmailApp.search(query, threads.length, size);
+    const page = GmailApp.search(query, offset + threads.length, size);
     page.forEach((thread) => threads.push(thread));
     if (page.length < size) break;
   }
@@ -429,6 +495,7 @@ function processMessageRecords(records, log, deadline) {
     try {
       if (!message) message = GmailApp.getMessageById(record.message_id);
     } catch (err) {
+      if (isGmailQuotaError(err)) throw err;
       counts.failed += 1;
       rememberLog(log, { getId: () => record.message_id, getSubject: () => record.subject || '' }, record, 'failed', {
         thread_id: record.thread_id || '',
@@ -457,6 +524,7 @@ function processMessageRecords(records, log, deadline) {
     try {
       action = applyHint(hint);
     } catch (err) {
+      if (isGmailQuotaError(err)) throw err;
       counts.failed += 1;
       rememberLog(log, message, record, 'failed', {
         thread_id: hint.threadId || safeThreadId(message),
@@ -496,6 +564,7 @@ function rememberLog(log, message, record, status, fields) {
         application_key: '',
         tab: '',
         last_error: '',
+        message_ms: record && record._time ? record._time : '',
       },
       fields || {},
       attempt
@@ -1692,6 +1761,7 @@ function loadLogRows() {
   });
   const records = [];
   const byId = {};
+  const byThread = {};
   for (let i = 1; i < values.length; i += 1) {
     const messageId = idx.message_id >= 0 ? String(values[i][idx.message_id] || '') : String(values[i][0] || '');
     if (!messageId) continue;
@@ -1706,11 +1776,16 @@ function loadLogRows() {
       tab: idx.tab >= 0 ? String(values[i][idx.tab] || '') : '',
       last_error: idx.last_error >= 0 ? String(values[i][idx.last_error] || '') : '',
       fetch_attempts: idx.fetch_attempts >= 0 ? Number(values[i][idx.fetch_attempts] || 0) : 0,
+      message_ms: idx.message_ms >= 0 ? Number(values[i][idx.message_ms] || 0) : 0,
     };
     records.push(record);
     byId[messageId] = record;
+    if (record.thread_id) {
+      if (!byThread[record.thread_id]) byThread[record.thread_id] = [];
+      byThread[record.thread_id].push(record);
+    }
   }
-  return { sheet, headers, idx, records, byId };
+  return { sheet, headers, idx, records, byId, byThread };
 }
 
 function upsertLog(log, fields) {
@@ -1719,14 +1794,24 @@ function upsertLog(log, fields) {
   const rowValues = LOG_HEADERS.map((name) => {
     if (name === 'synced_at') return new Date();
     if (name === 'fetch_attempts') return Number(fields.fetch_attempts || 0);
+    if (name === 'message_ms') return fields.message_ms ? String(fields.message_ms) : '';
     return fields[name] || '';
   });
   // Column F is parse_status (applied / review / ignored / failed). A copied tracker
   // tab still has the Result dropdown there, and Sheets rejects anything else.
   const row = existing ? existing.row : Math.max(sheet.getLastRow(), 1) + 1;
   writeLogRow(sheet, row, rowValues);
-  log.byId[fields.message_id] = Object.assign({}, existing || {}, fields, { row: row });
-  if (!existing) log.records.push(log.byId[fields.message_id]);
+  const saved = Object.assign({}, existing || {}, fields, { row: row });
+  log.byId[fields.message_id] = saved;
+  if (!existing) log.records.push(saved);
+  if (!log.byThread) log.byThread = {};
+  if (saved.thread_id) {
+    const list = log.byThread[saved.thread_id] || [];
+    const at = list.findIndex((item) => item.message_id === saved.message_id);
+    if (at >= 0) list[at] = saved;
+    else list.push(saved);
+    log.byThread[saved.thread_id] = list;
+  }
 }
 
 function writeLogRow(sheet, row, rowValues) {

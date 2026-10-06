@@ -47,7 +47,7 @@ Use **Tracker → Sync Gmail now** anytime you want an immediate pass. **Tracker
 - Hidden `_gmail_log` stores message_id, thread_id, parser_version, parse_status, and application_key. Existing three-column logs are migrated in place.
 - **Tracker → Sync Gmail now** reads new mail and any stale/failed log rows. A message is marked applied only after parse + row write succeed.
 - **Tracker → Recheck scraped mail** reprocesses a batch of stale messages (older parser_version, failed, or review). **Reprocess all stale mail** resets the batch offset and does the same.
-- **Sync Gmail now** reads the last 14 days before older mail, and stops before the 6-minute limit. Auto-sync picks up the rest. After a full pass, runs stay inside those 14 days. Bumping the parser version triggers one more full pass, still with recent mail first.
+- **Sync Gmail now** reads the newest 40 matching threads, then older mail 40 threads at a time. Threads already logged are not opened again. Auto-sync picks up the next batch. After a full pass, runs stay inside the last 14 days. Bumping the parser version triggers one more full pass, still with recent mail first. Gmail allows a limited number of reads per day; when that limit is hit, sync stops until midnight Pacific.
 - A lock keeps a timed run and a menu click from writing at the same time, so they cannot add the same row twice.
 - Date Applied comes only from the confirmation email. Follow-up mail without a role never moves a row between tabs.
 - No **Tracker** menu after reload? In the Apps Script editor, choose `installTracker` in the function dropdown and click **Run** once.

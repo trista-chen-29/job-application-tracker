@@ -475,4 +475,29 @@ assert.ok(searches.length > before, 'Sync Gmail now still runs after auto-sync i
 assert.strictEqual(triggers.filter((trigger) => trigger.getHandlerFunction() === 'syncGmail').length, 0);
 assert.strictEqual(triggers.filter((trigger) => trigger.getHandlerFunction() === 'syncOnOpen').length, 0);
 
+assert.strictEqual(ctx.isGmailQuotaError('Exception: Service invoked too many times for one day: gmail.'), true);
+assert.strictEqual(ctx.isGmailQuotaError('something else'), false);
+const freshThread = { getId: () => 'thread-new', getLastMessageDate: () => new Date(5000) };
+assert.strictEqual(ctx.threadNeedsFetch(freshThread, { byThread: {} }), true);
+const loggedThread = { getId: () => 'thread-old', getLastMessageDate: () => new Date(1000) };
+assert.strictEqual(
+  ctx.threadNeedsFetch(loggedThread, {
+    byThread: {
+      'thread-old': [{ message_ms: 1000, parse_status: 'applied', parser_version: 12, fetch_attempts: 0 }],
+    },
+  }),
+  false
+);
+assert.strictEqual(
+  ctx.threadNeedsFetch(
+    { getId: () => 'thread-old', getLastMessageDate: () => new Date(9000) },
+    {
+      byThread: {
+        'thread-old': [{ message_ms: 1000, parse_status: 'applied', parser_version: 12, fetch_attempts: 0 }],
+      },
+    }
+  ),
+  true
+);
+
 console.log('Code.gs parser and auto-sync checks passed');
