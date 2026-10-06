@@ -1447,7 +1447,7 @@ function isTrackerHighlight(color) {
 }
 
 // Earliest Date Applied first; rows without a date follow in their current order; blank rows stay at the bottom.
-// Rows are rewritten in place. A temporary column plus Range.sort was clearing fills and link colors.
+// Copy whole rows. Rewriting fills in place turns "no color" into white and covers the row color.
 function sortSheetByDate(sheet) {
   const cols = headerMap(sheet);
   const last = sheet.getLastRow();
@@ -1463,50 +1463,76 @@ function sortSheetByDate(sheet) {
     })
     .sort((a, b) => a.tier - b.tier || a.time - b.time || a.i - b.i);
   if (order.every((item, pos) => item.i === pos)) return false;
-  const rules = typeof body.getDataValidations === 'function' ? body.getDataValidations() : null;
-  const backgrounds = typeof body.getBackgrounds === 'function' ? body.getBackgrounds() : null;
-  const rich = typeof body.getRichTextValues === 'function' ? body.getRichTextValues() : null;
-  const fontColors = !rich && typeof body.getFontColors === 'function' ? body.getFontColors() : null;
-  // A Result value Sheets does not like (a blank, or a status outside the dropdown) aborts the write.
-  if (rules) {
-    body.setDataValidation(null);
-    if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
+  const book = typeof sheet.getParent === 'function' ? sheet.getParent() : null;
+  if (book && typeof book.insertSheet === 'function' && typeof body.copyTo === 'function') {
+    sortByCopyingRows(sheet, book, body, order, width);
+    return true;
   }
-  body.setValues(reorderRows(values, order));
-  if (rich && typeof body.setRichTextValues === 'function') body.setRichTextValues(reorderRows(rich, order));
-  if (fontColors && typeof body.setFontColors === 'function') body.setFontColors(reorderRows(fontColors, order));
-  if (backgrounds && typeof body.setBackgrounds === 'function') body.setBackgrounds(reorderRows(backgrounds, order));
-  if (rules && typeof body.setDataValidations === 'function') body.setDataValidations(reorderRows(rules, order));
-  return true;
+  return false;
 }
 
-// Blank Role and Location get their highlight back. Filled cells keep whatever color they already have.
+function sortByCopyingRows(sheet, book, body, order, width) {
+  const previous = typeof book.getActiveSheet === 'function' ? book.getActiveSheet() : null;
+  const stale = typeof book.getSheetByName === 'function' ? book.getSheetByName('_sort_buffer') : null;
+  if (stale && typeof book.deleteSheet === 'function') book.deleteSheet(stale);
+  const temp = book.insertSheet('_sort_buffer');
+  if (typeof temp.hideSheet === 'function') temp.hideSheet();
+  const rules = typeof body.getDataValidations === 'function' ? body.getDataValidations() : null;
+  const notes = typeof body.getNotes === 'function' ? body.getNotes() : null;
+  let copied = false;
+  try {
+    body.copyTo(temp.getRange(1, 1));
+    // A Result value Sheets does not like (a blank, or a status outside the dropdown) aborts the copy.
+    if (rules && typeof body.setDataValidation === 'function') {
+      body.setDataValidation(null);
+      if (typeof SpreadsheetApp.flush === 'function') SpreadsheetApp.flush();
+    }
+    copied = true;
+    for (let pos = 0; pos < order.length; pos += 1) {
+      const source = temp.getRange(order[pos].i + 1, 1, 1, width);
+      const dest = sheet.getRange(pos + 2, 1, 1, width);
+      source.copyTo(dest);
+      if (notes && typeof dest.setNotes === 'function') dest.setNotes([notes[order[pos].i]]);
+    }
+    if (rules && typeof body.setDataValidations === 'function') body.setDataValidations(reorderRows(rules, order));
+  } catch (err) {
+    if (copied) {
+      for (let i = 0; i < order.length; i += 1) {
+        temp.getRange(i + 1, 1, 1, width).copyTo(sheet.getRange(i + 2, 1, 1, width));
+      }
+      if (rules && typeof body.setDataValidations === 'function') body.setDataValidations(rules);
+    }
+    throw err;
+  } finally {
+    if (typeof book.deleteSheet === 'function') book.deleteSheet(temp);
+    if (previous && typeof book.setActiveSheet === 'function') book.setActiveSheet(previous);
+  }
+}
+
+// Blank Role and Location get their highlight back. Other cells are left alone, including cells with no fill.
 function paintMissingFields(sheet) {
   const cols = headerMap(sheet);
   const last = sheet.getLastRow();
   if (!sheet || cols.company < 0 || last < 2) return;
   const width = Math.max(sheet.getLastColumn(), 1);
   const range = sheet.getRange(2, 1, last - 1, width);
-  if (typeof range.getBackgrounds !== 'function' || typeof range.setBackgrounds !== 'function') return;
   const values = range.getValues();
-  const backgrounds = range.getBackgrounds();
-  let changed = false;
+  const backgrounds = typeof range.getBackgrounds === 'function' ? range.getBackgrounds() : null;
   for (let i = 0; i < values.length; i += 1) {
     if (!String(values[i][cols.company] || '').trim()) continue;
-    if (cols.role >= 0 && !String(values[i][cols.role] || '').trim() && !sameColor(backgrounds[i][cols.role], CONFIG.roleMissingColor)) {
-      backgrounds[i][cols.role] = CONFIG.roleMissingColor;
-      changed = true;
+    if (cols.role >= 0 && !String(values[i][cols.role] || '').trim()) {
+      if (!backgrounds || !sameColor(backgrounds[i][cols.role], CONFIG.roleMissingColor)) {
+        const cell = sheet.getRange(i + 2, cols.role + 1);
+        if (typeof cell.setBackground === 'function') cell.setBackground(CONFIG.roleMissingColor);
+      }
     }
-    if (
-      cols.location >= 0 &&
-      !String(values[i][cols.location] || '').trim() &&
-      !sameColor(backgrounds[i][cols.location], CONFIG.locationMissingColor)
-    ) {
-      backgrounds[i][cols.location] = CONFIG.locationMissingColor;
-      changed = true;
+    if (cols.location >= 0 && !String(values[i][cols.location] || '').trim()) {
+      if (!backgrounds || !sameColor(backgrounds[i][cols.location], CONFIG.locationMissingColor)) {
+        const cell = sheet.getRange(i + 2, cols.location + 1);
+        if (typeof cell.setBackground === 'function') cell.setBackground(CONFIG.locationMissingColor);
+      }
     }
   }
-  if (changed) range.setBackgrounds(backgrounds);
 }
 
 function dateSortValue(value) {

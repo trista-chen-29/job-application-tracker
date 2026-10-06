@@ -382,47 +382,88 @@ const colorRows = [
   ['02/18/2026', 'Verkada', 'Backend', '', '', 'Rejected', 'note'],
   ['04/08/2025', 'Element', 'Tech', 'Austin, TX', '', 'Offer', 'keep'],
 ];
-const colorFills = colorRows.map((row) => row.map(() => '#ffffff'));
+const colorFills = colorRows.map((row) => row.map(() => ''));
 colorFills[1][3] = '#ffd000';
 colorFills[2][0] = '#d9ead3';
 let insertedColumn = 0;
-const colorSheet = {
-  getLastRow: () => colorRows.length,
-  getLastColumn: () => colorRows[0].length,
-  insertColumnAfter() {
-    insertedColumn += 1;
+const colorBook = {
+  sheets: {},
+  getSheetByName(name) {
+    return this.sheets[name] || null;
   },
-  deleteColumn() {
-    insertedColumn += 1;
+  insertSheet(name) {
+    return makeColorSheet(name, []);
   },
-  getRange(r, c, nr, nc) {
-    const slice = (grid) => grid.slice(r - 1, r - 1 + nr).map((row) => row.slice(c - 1, c - 1 + nc));
-    return {
-      getValues: () => slice(colorRows),
-      getDisplayValues: () => slice(colorRows),
-      getBackgrounds: () => slice(colorFills),
-      getDataValidations: () => slice(colorRows).map((row) => row.map(() => null)),
-      setDataValidation() {},
-      setDataValidations() {},
-      setValues(grid) {
-        for (let i = 0; i < grid.length; i += 1) {
-          for (let j = 0; j < grid[i].length; j += 1) colorRows[r - 1 + i][c - 1 + j] = grid[i][j];
-        }
-      },
-      setBackgrounds(grid) {
-        for (let i = 0; i < grid.length; i += 1) {
-          for (let j = 0; j < grid[i].length; j += 1) colorFills[r - 1 + i][c - 1 + j] = grid[i][j];
-        }
-      },
-    };
+  deleteSheet(sheet) {
+    delete this.sheets[sheet.getName()];
   },
+  getActiveSheet() {
+    return colorSheet;
+  },
+  setActiveSheet() {},
 };
+function makeColorSheet(name, seed) {
+  const rows = seed;
+  const fills = seed === colorRows ? colorFills : seed.map((row) => row.map(() => ''));
+  const sheet = {
+    getName: () => name,
+    getParent: () => colorBook,
+    getLastRow: () => Math.max(rows.length, 1),
+    getLastColumn: () => (rows[0] || colorRows[0]).length,
+    hideSheet() {},
+    insertColumnAfter() {
+      insertedColumn += 1;
+    },
+    getRange(r, c, nr, nc) {
+      const height = nr || 1;
+      const span = nc || 1;
+      const range = {
+        getValues: () => rows.slice(r - 1, r - 1 + height).map((row) => row.slice(c - 1, c - 1 + span)),
+        getDisplayValues() {
+          return this.getValues();
+        },
+        getBackgrounds: () => fills.slice(r - 1, r - 1 + height).map((row) => row.slice(c - 1, c - 1 + span)),
+        getDataValidations: () => rows.slice(r - 1, r - 1 + height).map((row) => row.slice(c - 1, c - 1 + span).map(() => null)),
+        getNotes: () => rows.slice(r - 1, r - 1 + height).map((row) => row.slice(c - 1, c - 1 + span).map(() => '')),
+        setDataValidation() {},
+        setDataValidations() {},
+        setNotes() {},
+        setBackground(color) {
+          fills[r - 1][c - 1] = color;
+        },
+        copyTo(dest) {
+          const grid = rows.slice(r - 1, r - 1 + height).map((row) => row.slice(c - 1, c - 1 + span));
+          const paint = fills.slice(r - 1, r - 1 + height).map((row) => row.slice(c - 1, c - 1 + span));
+          dest._paste(grid, paint);
+        },
+        _paste(grid, paint) {
+          for (let i = 0; i < grid.length; i += 1) {
+            while (rows.length < r + i) {
+              rows.push(colorRows[0].map(() => ''));
+              fills.push(colorRows[0].map(() => ''));
+            }
+            for (let j = 0; j < grid[i].length; j += 1) {
+              rows[r - 1 + i][c - 1 + j] = grid[i][j];
+              fills[r - 1 + i][c - 1 + j] = paint[i][j];
+            }
+          }
+        },
+      };
+      return range;
+    },
+  };
+  colorBook.sheets[name] = sheet;
+  return sheet;
+}
+const colorSheet = makeColorSheet('internships-color', colorRows);
 assert.strictEqual(ctx.sortSheetByDate(colorSheet), true);
 assert.strictEqual(insertedColumn, 0, 'sorting must not insert a column');
+assert.strictEqual(colorBook.getSheetByName('_sort_buffer'), null);
 assert.strictEqual(colorRows[1][1], 'Element');
 assert.strictEqual(colorRows[2][1], 'Verkada');
 assert.strictEqual(colorFills[1][0], '#d9ead3');
 assert.strictEqual(colorFills[2][3], '#ffd000');
+assert.strictEqual(colorFills[1][1], '', 'a cell with no fill stays unpainted');
 colorRows[2][2] = '';
 ctx.paintMissingFields(colorSheet);
 assert.strictEqual(colorFills[1][0], '#d9ead3');
